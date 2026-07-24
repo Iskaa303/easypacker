@@ -58,7 +58,7 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
         version: args.version.clone(),
         category: args.category.clone(),
         loader: args.loader.clone(),
-        project_type: args.r#type.clone(),
+        project_type: args.r#type.clone().or(Some("mod".into())),
         sort: args.sort.clone(),
         limit: args.limit,
         offset: args.offset,
@@ -82,8 +82,18 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
             }
         }
     };
+    let results: Vec<_> = results
+        .into_iter()
+        .filter(|r| {
+            let t = r.project_type.to_lowercase();
+            let allowed = ["mod", "resourcepack", "shader", "datapack", "world"];
+            allowed.contains(&t.as_str())
+                && !r.title.to_lowercase().contains("modpack")
+                && !r.description.to_lowercase().contains("modpack")
+        })
+        .collect();
 
-    println!("─── {} results ───", results.len());
+
     for (i, r) in results.iter().enumerate() {
         let url = r.url.as_deref().unwrap_or("-");
         let license = r.license.as_deref().unwrap_or("-");
@@ -99,8 +109,13 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
             "     License: {}  Loaders: {}  MC: {}",
             license, loaders, latest
         );
-        println!("     {}↓ {}★", r.downloads, r.follows);
-        println!("     {}", url);
+        let stats = if r.follows > 0 {
+            format!("{}↓ {}★", r.downloads, r.follows)
+        } else {
+            format!("{}↓", r.downloads)
+        };
+        println!("     {stats}");
+        println!("     {url}");
         if !r.description.is_empty() {
             println!("     {}", truncate(&r.description, 70));
         }

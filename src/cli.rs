@@ -27,10 +27,9 @@ pub struct Cli {
     #[arg(short, long)]
     pub loader: Option<String>,
 
-    /// Project type (mod, resourcepack, datapack, shader, modpack)
+    /// Project type (mod, resourcepack, datapack, shader)
     #[arg(short = 'y', long)]
     pub r#type: Option<String>,
-
     /// Sort order (relevance, downloads, follows, updated)
     #[arg(short, long, default_value = "relevance")]
     pub sort: String,

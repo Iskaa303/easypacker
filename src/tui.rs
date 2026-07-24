@@ -28,12 +28,22 @@ enum Focus {
     Results,
 }
 
-#[derive(Default)]
 struct FiltersState {
     version: String,
     category: String,
     loader: String,
     project_type: String,
+}
+
+impl Default for FiltersState {
+    fn default() -> Self {
+        Self {
+            version: String::new(),
+            category: String::new(),
+            loader: String::new(),
+            project_type: "mod".into(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -418,14 +428,15 @@ async fn handle_key(app: &mut App, key: KeyCode, cfg: &Config, tx: &tokio::sync:
                 });
                 let tx = tx.clone();
                 let platform = app.platform.clone();
+                let api_key = cfg.get_api_key(None).ok().map(|k| k.clone());
                 tokio::spawn(async move {
-                    let options = fetch_options(platform, &kind).await.unwrap_or_default();
+                    let options = fetch_options(platform, &kind, api_key.as_deref()).await.unwrap_or_default();
                     let _ = tx
-                        .send(AppEvent::BrowseOptions {
+.send(AppEvent::BrowseOptions {
                             kind,
                             options,
                         })
-                        .await;
+.await;
                 });
             }
             KeyCode::Char(c) => match app.filter_selected {
@@ -552,7 +563,7 @@ to be prompted for the key."
         version: if app.filters.version.is_empty() { None } else { Some(app.filters.version.clone()) },
         category: if app.filters.category.is_empty() { None } else { Some(app.filters.category.clone()) },
         loader: if app.filters.loader.is_empty() { None } else { Some(app.filters.loader.clone()) },
-        project_type: if app.filters.project_type.is_empty() { None } else { Some(app.filters.project_type.clone()) },
+        project_type: if app.filters.project_type.is_empty() { Some("mod".into()) } else { Some(app.filters.project_type.clone()) },
         sort: "relevance".into(),
         limit: 25,
         offset: 0,
@@ -565,7 +576,16 @@ to be prompted for the key."
     tokio::spawn(async move {
         let event = match platform {
             Platform::Modrinth => match ModrinthClient::search(&filters).await {
-                Ok(results) => AppEvent::Results(results),
+                Ok(results) => {
+                    let results: Vec<_> = results.into_iter().filter(|r| {
+                        let t = r.project_type.to_lowercase();
+                        let allowed = ["mod", "resourcepack", "shader", "datapack", "world"];
+                        allowed.contains(&t.as_str())
+                            && !r.title.to_lowercase().contains("modpack")
+                            && !r.description.to_lowercase().contains("modpack")
+                    }).collect();
+                    AppEvent::Results(results)
+                }
                 Err(e) => AppEvent::Error(format!("Modrinth error: {e}")),
             },
             Platform::CurseForge => {
@@ -577,7 +597,16 @@ to be prompted for the key."
                     }
                 };
                 match CurseForgeClient::new(&key).search(&filters).await {
-                    Ok(results) => AppEvent::Results(results),
+                    Ok(results) => {
+                        let results: Vec<_> = results.into_iter().filter(|r| {
+                            let t = r.project_type.to_lowercase();
+                            let allowed = ["mod", "resourcepack", "shader", "datapack", "world"];
+                            allowed.contains(&t.as_str())
+                                && !r.title.to_lowercase().contains("modpack")
+                                && !r.description.to_lowercase().contains("modpack")
+                        }).collect();
+                        AppEvent::Results(results)
+                    }
                     Err(e) => AppEvent::Error(format!("CurseForge error: {e}")),
                 }
             }
@@ -586,10 +615,10 @@ to be prompted for the key."
     });
 }
 
-async fn fetch_options(platform: Platform, kind: &FilterKind) -> Result<Vec<String>> {
+async fn fetch_options(platform: Platform, kind: &FilterKind, api_key: Option<&str>) -> Result<Vec<String>> {
     match platform {
         Platform::Modrinth => fetch_modrinth_options(kind).await,
-        Platform::CurseForge => Ok(fetch_curseforge_options(kind)),
+        Platform::CurseForge => Ok(fetch_curseforge_options(kind, api_key).await),
     }
 }
 
@@ -639,7 +668,6 @@ async fn fetch_modrinth_options(kind: &FilterKind) -> Result<Vec<String>> {
         }
         FilterKind::Type => Ok(vec![
             "mod".into(),
-            "modpack".into(),
             "resourcepack".into(),
             "shader".into(),
             "datapack".into(),
@@ -647,11 +675,18 @@ async fn fetch_modrinth_options(kind: &FilterKind) -> Result<Vec<String>> {
     }
 }
 
-fn fetch_curseforge_options(kind: &FilterKind) -> Vec<String> {
+async fn fetch_curseforge_options(kind: &FilterKind, _api_key: Option<&str>) -> Vec<String> {
     match kind {
+        FilterKind::Version => {
+            vec!["26.2", "26.1.2", "26.1.1", "26.1", "1.21.11", "1.21.10", "1.21.9", "1.21.8", "1.21.7", "1.21.6", "1.21.5", "1.21.4", "1.21.3", "1.21.2", "1.21.1", "1.21", "1.20.6", "1.20.5", "1.20.4", "1.20.3", "1.20.2", "1.20.1", "1.20", "1.19.4", "1.19.3", "1.19.2", "1.19.1", "1.19", "1.18.2", "1.18.1", "1.18", "1.17.1", "1.17", "1.16.5", "1.16.4", "1.16.3", "1.16.2", "1.16.1", "1.16", "1.15.2", "1.15.1", "1.15", "1.14.4", "1.14.3", "1.14.2", "1.14.1", "1.14", "1.13.2", "1.13.1", "1.13", "1.12.2", "1.12.1", "1.12", "1.11.2", "1.11.1", "1.11", "1.10.2", "1.10.1", "1.10", "1.9.4", "1.9.3", "1.9.2", "1.9.1", "1.9", "1.8.9", "1.8.8", "1.8.7", "1.8.6", "1.8.5", "1.8.4", "1.8.3", "1.8.2", "1.8.1", "1.8", "1.7.10", "1.7.9", "1.7.8", "1.7.7", "1.7.6", "1.7.5", "1.7.4", "1.7.3", "1.7.2", "1.7.1", "1.7", "1.6.4", "1.6.2", "1.6.1", "1.6", "1.5.3", "1.5.2", "1.5.1", "1.5.0", "1.4.7", "1.4.6", "1.4.5", "1.4.4", "1.4.2", "1.3.2", "1.3.1", "1.2.8", "1.2.5", "1.2.4", "1.2.3", "1.2.2", "1.2.1", "1.2", "1.1", "1.0.0", "1.0", "0.16"]
+.iter().map(|s| s.to_string()).collect()
+        }
+        FilterKind::Category => {
+            vec!["Addons", "Applied Energistics 2", "Blood Magic", "Buildcraft", "CraftTweaker", "Create", "Farmer\'s Delight", "Forestry", "Galacticraft", "Industrial Craft", "Integrated Dynamics", "KubeJS", "Refined Storage", "Skyblock", "Thaumcraft", "Thermal Expansion", "Tinker\'s Construct", "Twilight Forest", "Adventure and RPG", "API and Library", "Armor Tools and Weapons", "Bug Fixes", "Cosmetic", "CreativeMode", "Education", "Food", "Horror", "Magic", "Map and Information", "MCreator", "Miscellaneous", "ModJam 2025", "Performance", "Redstone", "Server Utility", "Storage", "Technology", "Automation", "Energy", "Energy Fluid and Item Transport", "Farming", "Genetics", "Player Transport", "Processing", "Twitch Integration", "Utility and QoL", "World Gen", "Biomes", "Dimensions", "Mobs", "Ores and Resources", "Structures"]
+.iter().map(|s| s.to_string()).collect()
+        }
         FilterKind::Loader => vec!["forge".into(), "fabric".into(), "neoforge".into(), "quilt".into()],
         FilterKind::Type => vec!["mod".into(), "resourcepack".into(), "datapack".into()],
-        _ => vec![],
     }
 }
 
@@ -996,7 +1031,6 @@ fn render_results(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 
         let (icon_char, icon_color) = match r.project_type.to_lowercase().as_str() {
             "mod" => ('M', Color::Blue),
-            "modpack" => ('P', Color::Cyan),
             "resourcepack" | "resource-pack" | "texture-pack" => ('R', Color::Green),
             "shader" => ('S', Color::Yellow),
             "datapack" | "data-pack" => ('D', Color::Magenta),
@@ -1010,7 +1044,14 @@ fn render_results(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             Span::raw("  "),
             Span::styled(license, Style::default().fg(Color::Cyan)),
             Span::raw("  "),
-            Span::styled(format!("{}↓ {}★", r.downloads, r.follows), Style::default().fg(Color::Green)),
+            Span::styled(
+                if r.follows > 0 {
+                    format!("{}↓ {}★", r.downloads, r.follows)
+                } else {
+                    format!("{}↓", r.downloads)
+                },
+                Style::default().fg(Color::Green),
+            ),
         ]);
         let meta_line = Line::from(vec![
             Span::styled(format!("  {}  ", r.author), Style::default().fg(Color::Gray)),
