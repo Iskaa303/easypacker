@@ -185,6 +185,10 @@ async fn run(
                                     FilterKind::Type => app.filters.project_type = val,
                                     FilterKind::Platform => app.filters.platform = val,
                                 }
+                                // Auto-search when filter changes
+                                if !app.query.is_empty() {
+                                    start_search(app, cfg, tx).await;
+                                }
                             }
                         }
                         BrowseAction::Close => app.browse_mode = None,
