@@ -26,8 +26,7 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-eyre = "0.6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 color-eyre = "0.6"
 dirs = "6"
 ratatui-image = { version = "11", default-features = false }

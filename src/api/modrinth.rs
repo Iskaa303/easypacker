@@ -98,6 +98,10 @@ impl ModrinthClient {
                     license: h.license,
                     latest_version: latest,
                     loaders,
+                    modrinth_downloads: 0,
+                    modrinth_url: None,
+                    curseforge_downloads: 0,
+                    curseforge_url: None,
                 }
             })
             .collect())

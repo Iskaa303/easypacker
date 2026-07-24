@@ -26,7 +26,6 @@ pub struct SearchFilters {
     pub offset: usize,
 }
 
-#[derive(Debug, Clone)]
 pub struct SearchResult {
     pub title: String,
     pub author: String,
@@ -35,15 +34,17 @@ pub struct SearchResult {
     pub follows: u64,
     #[allow(dead_code)]
     pub versions: Vec<String>,
-    #[allow(dead_code)]
     pub platform: Platform,
     pub url: Option<String>,
-    #[allow(dead_code)]
     pub icon_url: Option<String>,
     pub project_type: String,
     pub license: Option<String>,
     pub latest_version: Option<String>,
     pub loaders: Vec<String>,
+    pub modrinth_downloads: u64,
+    pub modrinth_url: Option<String>,
+    pub curseforge_downloads: u64,
+    pub curseforge_url: Option<String>,
 }
 
 pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {

@@ -23,7 +23,6 @@ const TICK_RATE: Duration = Duration::from_millis(100);
 enum Focus {
     Neutral,
     Query,
-    Platform,
     Filters,
     Results,
 }
@@ -33,6 +32,7 @@ struct FiltersState {
     category: String,
     loader: String,
     project_type: String,
+    platform: String,
 }
 
 impl Default for FiltersState {
@@ -42,6 +42,7 @@ impl Default for FiltersState {
             category: String::new(),
             loader: String::new(),
             project_type: "mod".into(),
+            platform: "modrinth, curseforge".into(),
         }
     }
 }
@@ -52,6 +53,7 @@ enum FilterKind {
     Category,
     Loader,
     Type,
+    Platform,
 }
 
 impl FilterKind {
@@ -61,6 +63,7 @@ impl FilterKind {
             FilterKind::Category => "Category",
             FilterKind::Loader => "Loader",
             FilterKind::Type => "Type",
+            FilterKind::Platform => "Platform",
         }
     }
 }
@@ -86,7 +89,7 @@ enum Status {
 enum AppEvent {
     Results(Vec<SearchResult>),
     Error(String),
-    BrowseOptions { kind: FilterKind, options: Vec<String> },
+    BrowseOptions { kind: FilterKind, options: Vec<String>, saved: HashSet<String> },
     IconLoaded(usize, Vec<u8>),
 }
 
@@ -101,7 +104,6 @@ pub async fn run_tui(_args: Cli, mut cfg: Config) -> Result<()> {
     let mut app = App {
         query: String::new(),
         cursor_pos: 0,
-        platform: Platform::Modrinth,
         filters: FiltersState::default(),
         results: Vec::new(),
         focus: Focus::Neutral,
@@ -130,7 +132,6 @@ pub async fn run_tui(_args: Cli, mut cfg: Config) -> Result<()> {
 struct App {
     query: String,
     cursor_pos: usize,
-    platform: Platform,
     filters: FiltersState,
     results: Vec<SearchResult>,
     focus: Focus,
@@ -183,6 +184,7 @@ async fn run(
                                     FilterKind::Category => app.filters.category = val,
                                     FilterKind::Loader => app.filters.loader = val,
                                     FilterKind::Type => app.filters.project_type = val,
+                                    FilterKind::Platform => app.filters.platform = val,
                                 }
                             }
                         }
@@ -197,8 +199,7 @@ async fn run(
                         KeyCode::Esc => app.focus = Focus::Neutral,
                         KeyCode::Tab => {
                             app.focus = match app.focus {
-                                Focus::Neutral | Focus::Query => Focus::Platform,
-                                Focus::Platform => Focus::Filters,
+                                Focus::Neutral | Focus::Query => Focus::Filters,
                                 Focus::Filters => Focus::Results,
                                 Focus::Results => Focus::Query,
                             };
@@ -206,8 +207,7 @@ async fn run(
                         KeyCode::BackTab => {
                             app.focus = match app.focus {
                                 Focus::Neutral | Focus::Query => Focus::Results,
-                                Focus::Platform => Focus::Query,
-                                Focus::Filters => Focus::Platform,
+                                Focus::Filters => Focus::Query,
                                 Focus::Results => Focus::Filters,
                             };
                         }
@@ -244,15 +244,17 @@ async fn run(
                 AppEvent::Error(msg) => {
                     app.status = Status::Error(msg);
                 }
-                AppEvent::BrowseOptions { kind, options } => {
+                AppEvent::BrowseOptions { kind, options, saved } => {
                     if let Some(ref mut browse) = app.browse_mode {
                         if browse.kind == kind {
                             browse.options = options;
                             browse.filtered = (0..browse.options.len()).collect();
                             browse.selected = 0;
+                            browse.toggled = saved.iter().filter_map(|s| browse.options.iter().position(|o| o == s)).collect();
                         }
                     }
                 }
+
                 AppEvent::IconLoaded(i, bytes) => {
                     if i < app.proto_cache.len() {
                         match image::load_from_memory(&bytes) {
@@ -389,54 +391,40 @@ async fn handle_key(app: &mut App, key: KeyCode, cfg: &Config, tx: &tokio::sync:
             KeyCode::Enter => start_search(app, cfg, tx).await,
             _ => {}
         },
-        Focus::Platform => match key {
-            KeyCode::Left | KeyCode::Right => {
-                app.platform = match app.platform {
-                    Platform::Modrinth => Platform::CurseForge,
-                    Platform::CurseForge => Platform::Modrinth,
-                };
-                // Check if CurseForge has API key, prompt if not
-                if app.platform == Platform::CurseForge && cfg.get_api_key(None).is_err() {
-                    app.status = Status::ApiKeyPrompt;
-                    app.api_key_input.clear();
-                }
-            }
-            _ => {}
-        },
         Focus::Filters => match key {
-            KeyCode::Down => app.filter_selected = app.filter_selected.saturating_add(1).min(3),
+            KeyCode::Down => app.filter_selected = app.filter_selected.saturating_add(1).min(4),
             KeyCode::Up => app.filter_selected = app.filter_selected.saturating_sub(1),
             KeyCode::Enter => {
                 let kind = match app.filter_selected {
                     0 => FilterKind::Version,
                     1 => FilterKind::Category,
                     2 => FilterKind::Loader,
-                    _ => FilterKind::Type,
+                    3 => FilterKind::Type,
+                    _ => FilterKind::Platform,
                 };
-                // Pre-populate from existing text
-                let _current = match app.filter_selected {
-                    _ => (),
+                // Pre-populate toggled from current filter value
+                let current_val = match &kind {
+                    FilterKind::Version => &app.filters.version,
+                    FilterKind::Category => &app.filters.category,
+                    FilterKind::Loader => &app.filters.loader,
+                    FilterKind::Type => &app.filters.project_type,
+                    FilterKind::Platform => &app.filters.platform,
                 };
-                let toggled = HashSet::new();
+                let saved: std::collections::HashSet<String> = current_val.split(", ").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
                 app.browse_mode = Some(BrowseState {
                     kind: kind.clone(),
                     options: Vec::new(),
                     filtered: Vec::new(),
                     filter_text: String::new(),
                     selected: 0,
-                    toggled,
+                    toggled: HashSet::new(),
                 });
                 let tx = tx.clone();
-                let platform = app.platform.clone();
+                let platforms = app.filters.platform.clone();
                 let api_key = cfg.get_api_key(None).ok().map(|k| k.clone());
                 tokio::spawn(async move {
-                    let options = fetch_options(platform, &kind, api_key.as_deref()).await.unwrap_or_default();
-                    let _ = tx
-.send(AppEvent::BrowseOptions {
-                            kind,
-                            options,
-                        })
-.await;
+                    let options = fetch_options(&kind, &platforms, api_key.as_deref()).await.unwrap_or_default();
+                    let _ = tx.send(AppEvent::BrowseOptions { kind, options, saved }).await;
                 });
             }
             KeyCode::Char(c) => match app.filter_selected {
@@ -444,6 +432,7 @@ async fn handle_key(app: &mut App, key: KeyCode, cfg: &Config, tx: &tokio::sync:
                 1 => app.filters.category.push(c),
                 2 => app.filters.loader.push(c),
                 3 => app.filters.project_type.push(c),
+                4 => app.filters.platform.push(c),
                 _ => {}
             },
             KeyCode::Backspace => match app.filter_selected {
@@ -451,6 +440,7 @@ async fn handle_key(app: &mut App, key: KeyCode, cfg: &Config, tx: &tokio::sync:
                 1 => { let _ = app.filters.category.pop(); }
                 2 => { let _ = app.filters.loader.pop(); }
                 3 => { let _ = app.filters.project_type.pop(); }
+                4 => { let _ = app.filters.platform.pop(); }
                 _ => {}
             },
             KeyCode::Delete => match app.filter_selected {
@@ -458,6 +448,7 @@ async fn handle_key(app: &mut App, key: KeyCode, cfg: &Config, tx: &tokio::sync:
                 1 => { let _ = app.filters.category.pop(); }
                 2 => { let _ = app.filters.loader.pop(); }
                 3 => { let _ = app.filters.project_type.pop(); }
+                4 => { let _ = app.filters.platform.pop(); }
                 _ => {}
             },
             _ => {}
@@ -543,18 +534,6 @@ async fn start_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sende
         return;
     }
 
-    if app.platform == Platform::CurseForge && cfg.get_api_key(None).is_err() {
-        app.status = Status::Error(
-            "\
-No CurseForge API key configured.
-
-Get a key at: https://console.curseforge.com/
-Then press Esc and Tab to Platform tab, switch to CurseForge
-to be prompted for the key."
-                .into(),
-        );
-        return;
-    }
 
     app.status = Status::Searching;
 
@@ -569,56 +548,108 @@ to be prompted for the key."
         offset: 0,
     };
 
-    let platform = app.platform.clone();
     let tx = tx.clone();
     let api_key = cfg.get_api_key(None).ok();
+    let platforms: Vec<String> = app.filters.platform.split(", ").map(|s| s.to_string()).collect();
 
     tokio::spawn(async move {
-        let event = match platform {
-            Platform::Modrinth => match ModrinthClient::search(&filters).await {
-                Ok(results) => {
-                    let results: Vec<_> = results.into_iter().filter(|r| {
-                        let t = r.project_type.to_lowercase();
-                        let allowed = ["mod", "resourcepack", "shader", "datapack", "world"];
-                        allowed.contains(&t.as_str())
-                            && !r.title.to_lowercase().contains("modpack")
-                            && !r.description.to_lowercase().contains("modpack")
-                    }).collect();
-                    AppEvent::Results(results)
+        let mut all: Vec<SearchResult> = Vec::new();
+        for p in &platforms {
+            let event = match p.as_str() {
+                "modrinth" => match ModrinthClient::search(&filters).await {
+                    Ok(results) => Some(results),
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::Error(format!("Modrinth error: {e}"))).await;
+                        continue;
+                    }
+                },
+                "curseforge" => {
+                    let key = match &api_key {
+                        Some(k) => k,
+                        None => {
+                            let _ = tx.send(AppEvent::Error("CurseForge API key not configured.".into())).await;
+                            continue;
+                        }
+                    };
+                    match CurseForgeClient::new(key).search(&filters).await {
+                        Ok(results) => Some(results),
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::Error(format!("CurseForge error: {e}"))).await;
+                            continue;
+                        }
+                    }
                 }
-                Err(e) => AppEvent::Error(format!("Modrinth error: {e}")),
-            },
-            Platform::CurseForge => {
-                let key = match api_key {
-                    Some(k) => k,
-                    None => {
-                        AppEvent::Error("CurseForge API key not configured.".into());
-                        return;
+                _ => None,
+            };
+            if let Some(mut results) = event {
+                results.retain(|r| {
+                    let t = r.project_type.to_lowercase();
+                    let allowed = ["mod", "resourcepack", "shader", "datapack", "world"];
+                    allowed.contains(&t.as_str())
+                        && !r.title.to_lowercase().contains("modpack")
+                        && !r.description.to_lowercase().contains("modpack")
+                });
+                // Merge: if same title exists, fold in platform-specific data
+                for r in results {
+                    let lower = r.title.to_lowercase();
+                    if let Some(existing) = all.iter_mut().find(|e| e.title.to_lowercase() == lower) {
+                        match r.platform {
+                            Platform::Modrinth => {
+                                existing.modrinth_downloads = r.downloads;
+                                existing.modrinth_url = r.url;
+                            }
+                            Platform::CurseForge => {
+                                existing.curseforge_downloads = r.downloads;
+                                existing.curseforge_url = r.url;
+                            }
+                        }
+                    } else {
+                        let mut entry = r;
+                        match entry.platform {
+                            Platform::Modrinth => {
+                                entry.modrinth_downloads = entry.downloads;
+                                entry.modrinth_url = entry.url.clone();
+                            }
+                            Platform::CurseForge => {
+                                entry.curseforge_downloads = entry.downloads;
+                                entry.curseforge_url = entry.url.clone();
+                            }
+                        }
+                        all.push(entry);
                     }
-                };
-                match CurseForgeClient::new(&key).search(&filters).await {
-                    Ok(results) => {
-                        let results: Vec<_> = results.into_iter().filter(|r| {
-                            let t = r.project_type.to_lowercase();
-                            let allowed = ["mod", "resourcepack", "shader", "datapack", "world"];
-                            allowed.contains(&t.as_str())
-                                && !r.title.to_lowercase().contains("modpack")
-                                && !r.description.to_lowercase().contains("modpack")
-                        }).collect();
-                        AppEvent::Results(results)
-                    }
-                    Err(e) => AppEvent::Error(format!("CurseForge error: {e}")),
                 }
             }
-        };
-        let _ = tx.send(event).await;
+        }
+        if all.is_empty() && !platforms.is_empty() {
+            // errors already sent via tx
+            return;
+        }
+        let _ = tx.send(AppEvent::Results(all)).await;
     });
 }
 
-async fn fetch_options(platform: Platform, kind: &FilterKind, api_key: Option<&str>) -> Result<Vec<String>> {
-    match platform {
-        Platform::Modrinth => fetch_modrinth_options(kind).await,
-        Platform::CurseForge => Ok(fetch_curseforge_options(kind, api_key).await),
+async fn fetch_options(kind: &FilterKind, _platforms: &str, api_key: Option<&str>) -> Result<Vec<String>> {
+    match kind {
+        FilterKind::Platform => Ok(vec!["modrinth".into(), "curseforge".into()]),
+        FilterKind::Version | FilterKind::Category | FilterKind::Loader | FilterKind::Type => {
+            // Try each active platform for options
+            for p in _platforms.split(", ") {
+                match p {
+                    "modrinth" => match fetch_modrinth_options(kind).await {
+                        Ok(opts) if !opts.is_empty() => return Ok(opts),
+                        _ => {}
+                    },
+                    "curseforge" => {
+                        let opts = fetch_curseforge_options(kind, api_key).await;
+                        if !opts.is_empty() {
+                            return Ok(opts);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(vec![])
+        }
     }
 }
 
@@ -672,6 +703,7 @@ async fn fetch_modrinth_options(kind: &FilterKind) -> Result<Vec<String>> {
             "shader".into(),
             "datapack".into(),
         ]),
+        FilterKind::Platform => Ok(vec![]),
     }
 }
 
@@ -687,6 +719,7 @@ async fn fetch_curseforge_options(kind: &FilterKind, _api_key: Option<&str>) -> 
         }
         FilterKind::Loader => vec!["forge".into(), "fabric".into(), "neoforge".into(), "quilt".into()],
         FilterKind::Type => vec!["mod".into(), "resourcepack".into(), "datapack".into()],
+        FilterKind::Platform => vec![],
     }
 }
 
@@ -837,47 +870,19 @@ fn render_error(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
 
 fn render_header(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let neutral = app.focus == Focus::Neutral;
-    let (sel_text, sel_color) = match app.platform {
-        Platform::Modrinth => ("● Modrinth", Color::Green),
-        Platform::CurseForge => ("● CurseForge", Color::Yellow),
-    };
-
-    let platform_style = if app.focus == Focus::Platform {
-        Style::default().fg(sel_color).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(sel_color)
-    };
-
-    let neutral_indicator = if neutral {
-        " ◇".to_owned()
-    } else {
-        String::new()
-    };
-
+    let neutral_indicator = if neutral { " ◇".to_owned() } else { String::new() };
     let header = Line::from(vec![
         Span::styled(
             format!(" easypacker{} ", neutral_indicator),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("│", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!(" {}", sel_text), platform_style),
-        Span::styled(
-            match app.platform {
-                Platform::Modrinth => " CurseForge",
-                Platform::CurseForge => " Modrinth",
-            },
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Tab:nav ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Enter:search ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" │ Tab:nav Enter:search ", Style::default().fg(Color::DarkGray)),
         if neutral {
             Span::styled("q:quit", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
         } else {
             Span::styled("Esc:neutral", Style::default().fg(Color::DarkGray))
         },
     ]);
-
     frame.render_widget(
         Paragraph::new(header).block(Block::default().borders(Borders::BOTTOM)),
         area,
@@ -930,6 +935,7 @@ fn render_filters(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         filter_line("Category", &app.filters.category, focused, app.filter_selected == 1),
         filter_line("Loader", &app.filters.loader, focused, app.filter_selected == 2),
         filter_line("Type", &app.filters.project_type, focused, app.filter_selected == 3),
+        filter_line("Platform", &app.filters.platform, focused, app.filter_selected == 4),
     ];
 
     frame.render_widget(
@@ -1027,7 +1033,6 @@ fn render_results(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         let license = r.license.as_deref().unwrap_or("-");
         let latest = r.latest_version.as_deref().unwrap_or("-");
         let loaders_str = if r.loaders.is_empty() { "-".to_owned() } else { r.loaders.join(", ") };
-        let url = r.url.as_deref().unwrap_or("");
 
         let (icon_char, icon_color) = match r.project_type.to_lowercase().as_str() {
             "mod" => ('M', Color::Blue),
@@ -1037,29 +1042,48 @@ fn render_results(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             _ => ('?', Color::DarkGray),
         };
 
+        // Build platform badges
+        let mut badges = String::new();
+        if r.modrinth_downloads > 0 || r.modrinth_url.is_some() { badges.push_str("[M] "); }
+        if r.curseforge_downloads > 0 || r.curseforge_url.is_some() { badges.push_str("[C] "); }
+        // Build stats line
+        let mut stats_parts: Vec<String> = Vec::new();
+        if r.modrinth_downloads > 0 {
+            stats_parts.push(format!("M:{}↓", r.modrinth_downloads));
+        }
+        if r.curseforge_downloads > 0 {
+            stats_parts.push(format!("C:{}↓", r.curseforge_downloads));
+        }
+        if stats_parts.is_empty() {
+            stats_parts.push(format!("{}↓", r.downloads));
+        }
+        if r.follows > 0 {
+            stats_parts.push(format!("{}★", r.follows));
+        }
+        let stats_str = stats_parts.join("  ");
         let title_line = Line::from(vec![
-            Span::styled(format!("{}{}", prefix, r.title), sel_style.add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{}{}{}", prefix, r.title, badges), sel_style.add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled(format!("[{icon_char}]"), Style::default().fg(icon_color)),
+            Span::styled(format!("[{}]", icon_char), Style::default().fg(icon_color)),
             Span::raw("  "),
             Span::styled(license, Style::default().fg(Color::Cyan)),
             Span::raw("  "),
-            Span::styled(
-                if r.follows > 0 {
-                    format!("{}↓ {}★", r.downloads, r.follows)
-                } else {
-                    format!("{}↓", r.downloads)
-                },
-                Style::default().fg(Color::Green),
-            ),
+            Span::styled(stats_str, Style::default().fg(Color::Green)),
         ]);
         let meta_line = Line::from(vec![
             Span::styled(format!("  {}  ", r.author), Style::default().fg(Color::Gray)),
             Span::styled(format!("MC: {latest}"), Style::default().fg(Color::Yellow)),
             Span::styled(format!("  Loader: {loaders_str}"), Style::default().fg(Color::Magenta)),
         ]);
-        let url_line = if selected && !url.is_empty() {
-            Line::from(vec![Span::styled(format!("   {url}"), Style::default().fg(Color::Blue).underlined())])
+        // Build URL line — show both platform URLs if available
+        let mut url_parts: Vec<String> = Vec::new();
+        if let Some(ref u) = r.modrinth_url { url_parts.push(format!("M: {u}")); }
+        if let Some(ref u) = r.curseforge_url { url_parts.push(format!("C: {u}")); }
+        if url_parts.is_empty() {
+            if let Some(ref u) = r.url { url_parts.push(u.clone()); }
+        }
+        let url_line = if selected && !url_parts.is_empty() {
+            Line::from(vec![Span::styled(format!("   {}", url_parts.join("  ")), Style::default().fg(Color::Blue).underlined())])
         } else {
             Line::from("")
         };

@@ -176,6 +176,10 @@ impl CurseForgeClient {
                 license: None,
                 latest_version: latest_file.and_then(|f| f.game_version.clone()).or_else(|| versions.first().cloned()),
                 loaders,
+                modrinth_downloads: 0,
+                modrinth_url: None,
+                curseforge_downloads: 0,
+                curseforge_url: None,
             });
         }
         results.sort_by(|a, b| b.downloads.cmp(&a.downloads));
