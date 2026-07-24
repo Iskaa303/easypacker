@@ -1,6 +1,33 @@
 [package]
-name = "easy_packer"
+name = "easypacker"
 version = "0.1.0"
 edition = "2024"
+description = "A simple TUI/CLI tool for creating Minecraft Modpacks."
+
+[profile.release]
+opt-level = 2
+strip = true
+lto = true
+codegen-units = 1
+
+[lints.rust]
+unused = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.30"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+eyre = "0.6"
+color-eyre = "0.6"
+dirs = "6"
+ratatui-image = { version = "11", default-features = false }

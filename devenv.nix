@@ -1,3 +1,3 @@
 { pkgs, ... }: {
-  packages = [ pkgs.cargo ];
+  packages = with pkgs; [ cargo rustfmt clippy ];
 }

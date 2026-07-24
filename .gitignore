@@ -4,3 +4,6 @@
 # Devenv
 devenv.lock
 .devenv
+
+# Env
+.env
