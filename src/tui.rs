@@ -195,6 +195,9 @@ async fn run(
                 } else {
                     match key.code {
                         KeyCode::Char('q') if app.focus == Focus::Neutral => break Ok(()),
+                        KeyCode::Char('s') if app.focus == Focus::Neutral => app.focus = Focus::Query,
+                        KeyCode::Char('f') if app.focus == Focus::Neutral => app.focus = Focus::Filters,
+                        KeyCode::Char('r') if app.focus == Focus::Neutral => app.focus = Focus::Results,
                         KeyCode::Esc => app.focus = Focus::Neutral,
                         KeyCode::Tab => {
                             app.focus = match app.focus {
@@ -779,18 +782,20 @@ fn render_error(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
 fn render_header(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let neutral = app.focus == Focus::Neutral;
     let neutral_indicator = if neutral { " ◇".to_owned() } else { String::new() };
-    let header = Line::from(vec![
+    let mut header_parts = vec![
         Span::styled(
             format!(" easypacker{} ", neutral_indicator),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" │ Tab:nav Enter:search ", Style::default().fg(Color::DarkGray)),
-        if neutral {
-            Span::styled("q:quit", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-        } else {
-            Span::styled("Esc:neutral", Style::default().fg(Color::DarkGray))
-        },
-    ]);
+        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+    ];
+    if neutral {
+        header_parts.push(Span::styled("s:search f:filters r:results ", Style::default().fg(Color::DarkGray)));
+        header_parts.push(Span::styled("q:quit", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+    } else {
+        header_parts.push(Span::styled("Esc:neutral", Style::default().fg(Color::DarkGray)));
+    }
+    let header = Line::from(header_parts);
     frame.render_widget(
         Paragraph::new(header).block(Block::default().borders(Borders::BOTTOM)),
         area,
@@ -913,27 +918,30 @@ fn render_results(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(&block, area);
 
-    let max_visible = (inner.height as usize).saturating_div(3).min(app.results.len().saturating_sub(app.scroll));
-    app.visible_count.set(max_visible);
-    // Cast to non-const to satisfy const-ref, store for scroll threshold
-    let _ = max_visible;
-    for vis in 0..max_visible {
+    let max_items = (inner.height as usize).saturating_div(3).min(app.results.len().saturating_sub(app.scroll));
+    app.visible_count.set(max_items);
+    let mut current_y = inner.y;
+    for vis in 0..max_items {
         let idx = app.scroll + vis;
         if idx >= app.results.len() { break; }
         let r = &app.results[idx];
-        let y = inner.y + (vis as u16) * 3;
+        let selected = idx == app.selected && focused;
 
-        // Icon area
+        // Dynamic height: 3 normally, 4 when selected with URLs
+        let has_url = r.cross.modrinth_url.is_some() || r.cross.curseforge_url.is_some() || r.url.is_some();
+        let item_lines: usize = if selected && has_url { 4 } else { 3 };
+        let y = current_y;
+        current_y += item_lines as u16;
+
+        // Icon
         let icon_area = Rect::new(inner.x + 1, y, 6, 2);
         if let Some(ref proto) = app.proto_cache.get(idx).and_then(|p| p.as_ref()) {
-            let image = Image::new(proto);
-            frame.render_widget(image, icon_area);
+            frame.render_widget(Image::new(proto), icon_area);
         }
 
         // Text
         let text_x = inner.x + 8;
         let text_w = inner.width.saturating_sub(9);
-        let selected = idx == app.selected && focused;
         let sel_style = if selected {
             Style::default().bg(Color::Blue).fg(Color::White)
         } else {
@@ -952,24 +960,14 @@ fn render_results(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             _ => ('?', Color::DarkGray),
         };
 
-        // Build platform badges
         let mut badges = String::new();
         if r.cross.modrinth_downloads > 0 || r.cross.modrinth_url.is_some() { badges.push_str("[M] "); }
         if r.cross.curseforge_downloads > 0 || r.cross.curseforge_url.is_some() { badges.push_str("[C] "); }
-        // Build stats line
         let mut stats_parts: Vec<String> = Vec::new();
-        if r.cross.modrinth_downloads > 0 {
-            stats_parts.push(format!("M:{}↓", r.cross.modrinth_downloads));
-        }
-        if r.cross.curseforge_downloads > 0 {
-            stats_parts.push(format!("C:{}↓", r.cross.curseforge_downloads));
-        }
-        if stats_parts.is_empty() {
-            stats_parts.push(format!("{}↓", r.downloads));
-        }
-        if r.follows > 0 {
-            stats_parts.push(format!("{}★", r.follows));
-        }
+        if r.cross.modrinth_downloads > 0 { stats_parts.push(format!("M:{}↓", r.cross.modrinth_downloads)); }
+        if r.cross.curseforge_downloads > 0 { stats_parts.push(format!("C:{}↓", r.cross.curseforge_downloads)); }
+        if stats_parts.is_empty() { stats_parts.push(format!("{}↓", r.downloads)); }
+        if r.follows > 0 { stats_parts.push(format!("{}★", r.follows)); }
         let stats_str = stats_parts.join("  ");
         let title_line = Line::from(vec![
             Span::styled(format!("{}{}{}", prefix, r.title, badges), sel_style.add_modifier(Modifier::BOLD)),
@@ -985,33 +983,39 @@ fn render_results(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             Span::styled(format!("MC: {latest}"), Style::default().fg(Color::Yellow)),
             Span::styled(format!("  Loader: {loaders_str}"), Style::default().fg(Color::Magenta)),
         ]);
-        // Build URL line — show both platform URLs if available
-        let mut url_parts: Vec<String> = Vec::new();
-        if let Some(ref u) = r.cross.modrinth_url { url_parts.push(format!("M: {u}")); }
-        if let Some(ref u) = r.cross.curseforge_url { url_parts.push(format!("C: {u}")); }
-        if url_parts.is_empty() {
-            if let Some(ref u) = r.url { url_parts.push(u.clone()); }
+        let mut url_lines: Vec<Line> = Vec::new();
+        if selected {
+            if let Some(ref u) = r.cross.modrinth_url {
+                url_lines.push(Line::from(vec![Span::styled(format!("   M: {u}"), Style::default().fg(Color::Blue).underlined())]));
+            }
+            if let Some(ref u) = r.cross.curseforge_url {
+                url_lines.push(Line::from(vec![Span::styled(format!("   C: {u}"), Style::default().fg(Color::Blue).underlined())]));
+            }
+            if url_lines.is_empty() {
+                if let Some(ref u) = r.url {
+                    url_lines.push(Line::from(vec![Span::styled(format!("   {u}"), Style::default().fg(Color::Blue).underlined())]));
+                }
+            }
         }
-        let url_line = if selected && !url_parts.is_empty() {
-            Line::from(vec![Span::styled(format!("   {}", url_parts.join("  ")), Style::default().fg(Color::Blue).underlined())])
-        } else {
-            Line::from("")
-        };
-
-        let text_area = Rect::new(text_x, y, text_w, 3);
-        frame.render_widget(Paragraph::new(vec![title_line, meta_line, url_line]), text_area);
+        let mut all_lines = vec![title_line, meta_line];
+        all_lines.extend(url_lines);
+        while all_lines.len() < item_lines {
+            all_lines.push(Line::from(""));
+        }
+        let text_area = Rect::new(text_x, y, text_w, item_lines as u16);
+        frame.render_widget(Paragraph::new(all_lines).wrap(Wrap { trim: false }), text_area);
     }
 }
 
 fn render_status(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let (text, style) = match &app.status {
         Status::Idle => (
-            " Type a query and press Enter to search. ↑↓ scroll, Tab:nav ".to_owned(),
+            " Type a query and press Enter to search. s:search f:filters r:results  ↑↓ scroll  Tab:nav ".to_owned(),
             Style::default().fg(Color::DarkGray),
         ),
         Status::Searching => (" Searching... ".to_owned(), Style::default().fg(Color::Yellow)),
         Status::Done => (
-            format!(" {} results — ↑↓ scroll, Tab:nav ", app.results.len()),
+            format!(" {} results — s:search f:filters r:results  ↑↓ scroll  Tab:nav ", app.results.len()),
             Style::default().fg(Color::DarkGray),
         ),
         Status::ApiKeyPrompt => (
