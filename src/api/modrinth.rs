@@ -30,7 +30,6 @@ struct Hit {
     categories: Vec<String>,
 }
 
-
 impl ModrinthClient {
     pub async fn search(filters: &SearchFilters) -> Result<Vec<SearchResult>> {
         let client = reqwest::Client::builder()
@@ -47,15 +46,25 @@ impl ModrinthClient {
         let mut facets: Vec<Vec<String>> = Vec::new();
 
         fn push_facet(facets: &mut Vec<Vec<String>>, prefix: &str, val: &str) {
-            let parts: Vec<String> = val.split(", ").filter(|s| !s.is_empty()).map(|s| format!("{prefix}:{s}")).collect();
+            let parts: Vec<String> = val
+                .split(", ")
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("{prefix}:{s}"))
+                .collect();
             if !parts.is_empty() {
                 facets.push(parts);
             }
         }
 
-        if let Some(ref v) = filters.version { push_facet(&mut facets, "versions", v); }
-        if let Some(ref l) = filters.loader { push_facet(&mut facets, "loaders", l); }
-        if let Some(ref t) = filters.project_type { push_facet(&mut facets, "project_type", t); }
+        if let Some(ref v) = filters.version {
+            push_facet(&mut facets, "versions", v);
+        }
+        if let Some(ref l) = filters.loader {
+            push_facet(&mut facets, "loaders", l);
+        }
+        if let Some(ref t) = filters.project_type {
+            push_facet(&mut facets, "project_type", t);
+        }
 
         if !facets.is_empty() {
             let encoded = serde_json::to_string(&facets)?;
@@ -74,9 +83,11 @@ impl ModrinthClient {
             .hits
             .into_iter()
             .map(|h| {
-                let loaders: Vec<String> = h.categories.into_iter().filter(|c| {
-                    filters::LOADERS.contains(&c.to_lowercase().as_str())
-                }).collect();
+                let loaders: Vec<String> = h
+                    .categories
+                    .into_iter()
+                    .filter(|c| filters::LOADERS.contains(&c.to_lowercase().as_str()))
+                    .collect();
                 let latest = h.versions.last().cloned();
                 // Use the type that matches the user's filter, or fall back to primary
                 let pt = filters.project_type.as_deref().unwrap_or("mod");

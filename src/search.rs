@@ -4,11 +4,11 @@ use crate::app::App;
 use crate::config::Config;
 use crate::types::*;
 use crossterm::event::KeyCode;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
-use ratatui::Frame;
 use ratatui_image::Image;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -95,7 +95,10 @@ fn update_filtered(browse: &mut BrowseState) {
             .options
             .iter()
             .enumerate()
-            .filter(|(_, opt)| opt.to_lowercase().contains(&browse.filter_text.to_lowercase()))
+            .filter(|(_, opt)| {
+                opt.to_lowercase()
+                    .contains(&browse.filter_text.to_lowercase())
+            })
             .map(|(i, _)| i)
             .collect();
     }
@@ -176,13 +179,15 @@ pub(crate) async fn handle_key(
                     FilterKind::Version => {
                         filters::VERSIONS.iter().map(|s| s.to_string()).collect()
                     }
-                    FilterKind::Loader => {
-                        filters::LOADERS.iter().map(|s| s.to_string()).collect()
-                    }
+                    FilterKind::Loader => filters::LOADERS.iter().map(|s| s.to_string()).collect(),
                     FilterKind::Type => filters::TYPES.iter().map(|s| s.to_string()).collect(),
                     FilterKind::Platform => vec!["modrinth".into(), "curseforge".into()],
                 };
-                let _ = tx.try_send(AppEvent::BrowseOptions { kind, options, saved });
+                let _ = tx.try_send(AppEvent::BrowseOptions {
+                    kind,
+                    options,
+                    saved,
+                });
             }
             KeyCode::Char(c) => match app.filter_selected {
                 0 => app.filters.version.push(c),
@@ -342,7 +347,12 @@ pub(crate) async fn start_search(
     };
 
     let tx = tx.clone();
-    let platforms: Vec<String> = app.filters.platform.split(", ").map(|s| s.to_string()).collect();
+    let platforms: Vec<String> = app
+        .filters
+        .platform
+        .split(", ")
+        .map(|s| s.to_string())
+        .collect();
 
     if cfg.get_api_key(None).is_err() && platforms.iter().any(|p| p == "curseforge") {
         app.status = Status::ApiKeyPrompt;
@@ -369,9 +379,7 @@ pub(crate) async fn start_search(
                         Some(k) => k,
                         None => {
                             let _ = tx
-                                .send(AppEvent::Error(
-                                    "CurseForge API key not configured.".into(),
-                                ))
+                                .send(AppEvent::Error("CurseForge API key not configured.".into()))
                                 .await;
                             continue;
                         }
@@ -468,7 +476,11 @@ pub(crate) fn render_search_screen(frame: &mut Frame, app: &App) {
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let neutral = app.focus == Focus::Neutral;
-    let indicator = if neutral { " ◇".to_owned() } else { String::new() };
+    let indicator = if neutral {
+        " ◇".to_owned()
+    } else {
+        String::new()
+    };
     let mut parts = vec![
         Span::styled(
             format!(" easypacker{} ", indicator),
@@ -485,9 +497,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         ));
         parts.push(Span::styled(
             "q:back",
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     } else {
         parts.push(Span::styled(
@@ -538,10 +548,30 @@ fn render_filters(frame: &mut Frame, area: Rect, app: &App) {
     };
     let hint = if focused { " Enter:browse" } else { "" };
     let lines = vec![
-        filter_line("Version", &app.filters.version, focused, app.filter_selected == 0),
-        filter_line("Loader", &app.filters.loader, focused, app.filter_selected == 1),
-        filter_line("Type", &app.filters.project_type, focused, app.filter_selected == 2),
-        filter_line("Platform", &app.filters.platform, focused, app.filter_selected == 3),
+        filter_line(
+            "Version",
+            &app.filters.version,
+            focused,
+            app.filter_selected == 0,
+        ),
+        filter_line(
+            "Loader",
+            &app.filters.loader,
+            focused,
+            app.filter_selected == 1,
+        ),
+        filter_line(
+            "Type",
+            &app.filters.project_type,
+            focused,
+            app.filter_selected == 2,
+        ),
+        filter_line(
+            "Platform",
+            &app.filters.platform,
+            focused,
+            app.filter_selected == 3,
+        ),
     ];
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -624,9 +654,8 @@ fn render_browse(frame: &mut Frame, area: Rect, browse: &BrowseState) {
         browse.kind.label()
     );
     if browse.options.is_empty() {
-        let p = Paragraph::new(" Loading options… ").block(
-            Block::default().borders(Borders::ALL).title(title.as_str()),
-        );
+        let p = Paragraph::new(" Loading options… ")
+            .block(Block::default().borders(Borders::ALL).title(title.as_str()));
         frame.render_widget(p, area);
         return;
     }
@@ -657,12 +686,13 @@ fn render_browse(frame: &mut Frame, area: Rect, browse: &BrowseState) {
             )))
         })
         .collect();
-    let list_area = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title.as_str()),
+    let list_area = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(1),
     );
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title.as_str()));
     frame.render_widget(list, list_area);
 }
 
@@ -712,9 +742,8 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         let r = &app.results[idx];
         let selected = idx == app.selected && focused;
 
-        let has_url = r.cross.modrinth_url.is_some()
-            || r.cross.curseforge_url.is_some()
-            || r.url.is_some();
+        let has_url =
+            r.cross.modrinth_url.is_some() || r.cross.curseforge_url.is_some() || r.url.is_some();
         let item_lines: usize = if selected && has_url { 4 } else { 3 };
         let y = current_y;
         current_y += item_lines as u16;
@@ -776,17 +805,17 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
                 sel_style.add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(
-                format!("[{}]", icon_char),
-                Style::default().fg(icon_color),
-            ),
+            Span::styled(format!("[{}]", icon_char), Style::default().fg(icon_color)),
             Span::raw("  "),
             Span::styled(license, Style::default().fg(Color::Cyan)),
             Span::raw("  "),
             Span::styled(stats_str, Style::default().fg(Color::Green)),
         ]);
         let meta_line = Line::from(vec![
-            Span::styled(format!("  {}  ", r.author), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("  {}  ", r.author),
+                Style::default().fg(Color::Gray),
+            ),
             Span::styled(format!("MC: {latest}"), Style::default().fg(Color::Yellow)),
             Span::styled(
                 format!("  Loader: {loaders_str}"),
@@ -849,8 +878,5 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Red),
         ),
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(text, style))),
-        area,
-    );
+    frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
 }

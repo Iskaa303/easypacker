@@ -1,7 +1,7 @@
+use crate::api::types::SearchResult;
 use crate::project;
 use crate::types::*;
 use crate::ui;
-use crate::api::types::SearchResult;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use std::cell::Cell;

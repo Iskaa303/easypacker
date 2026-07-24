@@ -36,7 +36,6 @@ pub struct ProjectLinks {
     pub github: Option<String>,
 }
 
-
 impl ModpackProject {
     pub fn detect(dir: &Path) -> Option<Self> {
         let path = dir.join(MODPACK_FILE);
@@ -56,10 +55,7 @@ impl ModpackProject {
         Ok(())
     }
 
-    pub fn init_project(
-        dir: &Path,
-        project: &Self,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn init_project(dir: &Path, project: &Self) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(dir)?;
         project.save(dir)?;
         Ok(())

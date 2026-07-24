@@ -113,23 +113,40 @@ impl CurseForgeClient {
                 params.push(("classId", cid.to_string()));
             }
         }
-        let response = self.client.get(format!("{}/mods/search", BASE)).query(&params).send().await?;
+        let response = self
+            .client
+            .get(format!("{}/mods/search", BASE))
+            .query(&params)
+            .send()
+            .await?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(color_eyre::eyre::eyre!("CurseForge API error {status}: {body}"));
+            return Err(color_eyre::eyre::eyre!(
+                "CurseForge API error {status}: {body}"
+            ));
         }
         let body = response.text().await.unwrap_or_default();
         let parsed: SearchResponse = match serde_json::from_str(&body) {
             Ok(r) => r,
             Err(e) => {
-                let preview = if body.len() > 200 { format!("{}…", &body[..200]) } else { body.clone() };
-                return Err(color_eyre::eyre::eyre!("CurseForge decode error: {e}\nResponse preview: {preview}"));
+                let preview = if body.len() > 200 {
+                    format!("{}…", &body[..200])
+                } else {
+                    body.clone()
+                };
+                return Err(color_eyre::eyre::eyre!(
+                    "CurseForge decode error: {e}\nResponse preview: {preview}"
+                ));
             }
         };
         let mut results: Vec<SearchResult> = Vec::new();
         for m in parsed.data {
-            let author = m.authors.first().map(|a| a.name.clone()).unwrap_or_default();
+            let author = m
+                .authors
+                .first()
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
             let categories: Vec<String> = m.categories.iter().map(|c| c.name.clone()).collect();
             let latest_file = m.latest_files_indexes.iter().flatten().next();
             let versions: Vec<String> = m.game_versions.clone().unwrap_or_default();
@@ -137,7 +154,11 @@ impl CurseForgeClient {
                 .mod_loaders
                 .iter()
                 .flatten()
-                .filter_map(|ml| ml.name.as_ref().map(|n| n.split('-').next().unwrap_or(n).to_lowercase()))
+                .filter_map(|ml| {
+                    ml.name
+                        .as_ref()
+                        .map(|n| n.split('-').next().unwrap_or(n).to_lowercase())
+                })
                 .collect();
             if loaders.is_empty() {
                 if let Some(id) = latest_file.and_then(|f| f.mod_loader) {
@@ -153,11 +174,16 @@ impl CurseForgeClient {
                 downloads: m.downloads,
                 follows: 0,
                 platform: Platform::CurseForge,
-                url: m.links.and_then(|l| l.website_url).or(Some(format!("https://www.curseforge.com/minecraft/mc-mods/{}", m.slug))),
+                url: m.links.and_then(|l| l.website_url).or(Some(format!(
+                    "https://www.curseforge.com/minecraft/mc-mods/{}",
+                    m.slug
+                ))),
                 icon_url: m.logo.and_then(|l| l.url),
                 project_type: project_type_from_class_id(m.class_id, &categories),
                 license: None,
-                latest_version: latest_file.and_then(|f| f.game_version.clone()).or_else(|| versions.first().cloned()),
+                latest_version: latest_file
+                    .and_then(|f| f.game_version.clone())
+                    .or_else(|| versions.first().cloned()),
                 loaders,
                 cross: CrossPlatform::default(),
             });

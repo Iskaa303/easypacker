@@ -5,9 +5,11 @@ use crate::search;
 use crate::types::*;
 use crate::ui;
 use color_eyre::eyre::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::Frame;
 use ratatui_image::picker::Picker;
 use std::io::stdout;
@@ -120,9 +122,8 @@ async fn run(
                             if let Some(url) = url {
                                 if let Ok(resp) = reqwest::get(url).await {
                                     if let Ok(bytes) = resp.bytes().await {
-                                        let _ = tx
-                                            .send(AppEvent::IconLoaded(i, bytes.to_vec()))
-                                            .await;
+                                        let _ =
+                                            tx.send(AppEvent::IconLoaded(i, bytes.to_vec())).await;
                                     }
                                 }
                             }
@@ -134,7 +135,11 @@ async fn run(
                         app.status = Status::Error(msg);
                     }
                 }
-                AppEvent::BrowseOptions { kind, options, saved } => {
+                AppEvent::BrowseOptions {
+                    kind,
+                    options,
+                    saved,
+                } => {
                     if let Some(ref mut browse) = app.browse_mode {
                         if browse.kind == kind {
                             browse.options = options;
@@ -143,9 +148,7 @@ async fn run(
                             browse.scroll = 0;
                             browse.toggled = saved
                                 .iter()
-                                .filter_map(|s| {
-                                    browse.options.iter().position(|o| o == s)
-                                })
+                                .filter_map(|s| browse.options.iter().position(|o| o == s))
                                 .collect();
                         }
                     }
@@ -155,10 +158,11 @@ async fn run(
                         match image::load_from_memory(&bytes) {
                             Ok(dyn_img) => {
                                 let size = ratatui::prelude::Size::new(6, 2);
-                                match app
-                                    .picker
-                                    .new_protocol(dyn_img, size, ratatui_image::Resize::Fit(None))
-                                {
+                                match app.picker.new_protocol(
+                                    dyn_img,
+                                    size,
+                                    ratatui_image::Resize::Fit(None),
+                                ) {
                                     Ok(proto) => app.proto_cache[i] = Some(proto),
                                     Err(e) => eprintln!("protocol error for {i}: {e}"),
                                 }
@@ -280,8 +284,7 @@ fn handle_welcome(app: &mut App, key: KeyCode) {
                 app.mode = AppMode::MainMenu;
                 app.menu_selection = 0;
             } else {
-                app.welcome_state.error =
-                    Some("No modpack.json found at that path".into());
+                app.welcome_state.error = Some("No modpack.json found at that path".into());
             }
         }
         ui::WelcomeAction::Quit => app.quit_requested = true,
@@ -303,6 +306,17 @@ fn handle_menu(app: &mut App, key: KeyCode) {
             app.search_offset = 0;
             app.scroll = 0;
             app.selected = 0;
+            if let Some(ref proj) = app.project {
+                if !proj.minecraft.is_empty() {
+                    app.filters.version = proj.minecraft.clone();
+                }
+                if !proj.loader.is_empty() {
+                    app.filters.loader = proj.loader.clone();
+                }
+                if !proj.platforms.is_empty() {
+                    app.filters.platform = proj.platforms.join(", ");
+                }
+            }
             app.mode = AppMode::Search;
         }
         Some(1) => {
@@ -408,15 +422,11 @@ async fn handle_search_mode(
                     search::handle_key(app, key, &Config::load().unwrap_or_default(), tx).await;
                 }
             }
+        }
     }
 }
-}
 
-async fn handle_form_mode(
-    app: &mut App,
-    key: KeyCode,
-    _tx: &tokio::sync::mpsc::Sender<AppEvent>,
-) {
+async fn handle_form_mode(app: &mut App, key: KeyCode, _tx: &tokio::sync::mpsc::Sender<AppEvent>) {
     if app.browse_mode.is_some() {
         let action = {
             let b = app.browse_mode.as_mut().unwrap();
@@ -554,14 +564,46 @@ fn apply_form_to_project(proj: &mut project::ModpackProject, form: &ui::FormStat
 }
 
 fn form_to_project(form: &ui::FormState) -> project::ModpackProject {
-    let name = form.fields.get(0).map(|f| f.value.clone()).unwrap_or_default();
-    let version = form.fields.get(1).map(|f| f.value.clone()).unwrap_or_else(|| "1.0.0".into());
-    let authors = form.fields.get(2).map(|f| f.value.clone()).unwrap_or_default();
-    let credits = form.fields.get(3).map(|f| f.value.clone()).unwrap_or_default();
-    let description = form.fields.get(4).map(|f| f.value.clone()).unwrap_or_default();
-    let minecraft = form.fields.get(5).map(|f| f.value.clone()).unwrap_or_default();
-    let loader = form.fields.get(6).map(|f| f.value.clone()).unwrap_or_default();
-    let platforms_str = form.fields.get(7).map(|f| f.value.clone()).unwrap_or_default();
+    let name = form
+        .fields
+        .get(0)
+        .map(|f| f.value.clone())
+        .unwrap_or_default();
+    let version = form
+        .fields
+        .get(1)
+        .map(|f| f.value.clone())
+        .unwrap_or_else(|| "1.0.0".into());
+    let authors = form
+        .fields
+        .get(2)
+        .map(|f| f.value.clone())
+        .unwrap_or_default();
+    let credits = form
+        .fields
+        .get(3)
+        .map(|f| f.value.clone())
+        .unwrap_or_default();
+    let description = form
+        .fields
+        .get(4)
+        .map(|f| f.value.clone())
+        .unwrap_or_default();
+    let minecraft = form
+        .fields
+        .get(5)
+        .map(|f| f.value.clone())
+        .unwrap_or_default();
+    let loader = form
+        .fields
+        .get(6)
+        .map(|f| f.value.clone())
+        .unwrap_or_default();
+    let platforms_str = form
+        .fields
+        .get(7)
+        .map(|f| f.value.clone())
+        .unwrap_or_default();
     let platforms: Vec<String> = platforms_str
         .split(", ")
         .map(|s| s.trim().to_string())
@@ -604,4 +646,3 @@ fn form_to_project(form: &ui::FormState) -> project::ModpackProject {
         platforms,
     }
 }
-

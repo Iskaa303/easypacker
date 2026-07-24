@@ -1,7 +1,7 @@
 mod curseforge;
+pub mod filters;
 mod modrinth;
 pub mod types;
-pub mod filters;
 
 use crate::cli::Cli;
 use crate::config::Config;
@@ -30,26 +30,28 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
 
     let results = match platform {
         Platform::Modrinth => ModrinthClient::search(&filters).await?,
-        Platform::CurseForge => {
-            match cfg.get_api_key(args.api_key.as_deref()) {
-                Ok(key) => CurseForgeClient::new(&key).search(&filters).await?,
-                Err(_) => {
-                    eprintln!("CurseForge API key needed.");
-                    eprintln!("Get a free key at: https://console.curseforge.com/");
-                    eprint!("Paste your API key: ");
-                    use std::io::Write;
-                    std::io::stderr().flush().ok();
-                    let key = rpassword::read_password()?;
-                    if key.is_empty() {
-                        return Err(color_eyre::eyre::eyre!("No API key entered."));
-                    }
-                    if let Err(e) = (Config { curseforge_api_key: Some(key.clone()) }).save() {
-                        eprintln!("Warning: could not save API key: {e}");
-                    }
-                    CurseForgeClient::new(&key).search(&filters).await?
+        Platform::CurseForge => match cfg.get_api_key(args.api_key.as_deref()) {
+            Ok(key) => CurseForgeClient::new(&key).search(&filters).await?,
+            Err(_) => {
+                eprintln!("CurseForge API key needed.");
+                eprintln!("Get a free key at: https://console.curseforge.com/");
+                eprint!("Paste your API key: ");
+                use std::io::Write;
+                std::io::stderr().flush().ok();
+                let key = rpassword::read_password()?;
+                if key.is_empty() {
+                    return Err(color_eyre::eyre::eyre!("No API key entered."));
                 }
+                if let Err(e) = (Config {
+                    curseforge_api_key: Some(key.clone()),
+                })
+                .save()
+                {
+                    eprintln!("Warning: could not save API key: {e}");
+                }
+                CurseForgeClient::new(&key).search(&filters).await?
             }
-        }
+        },
     };
     let results: Vec<_> = results
         .into_iter()
@@ -61,7 +63,6 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
             allowed.contains(&t.as_str())
         })
         .collect();
-
 
     for (i, r) in results.iter().enumerate() {
         let url = r.url.as_deref().unwrap_or("-");
