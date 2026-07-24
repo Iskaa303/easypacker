@@ -1,6 +1,8 @@
 use super::types::{CrossPlatform, Platform, SearchFilters, SearchResult};
+use crate::api::filters;
 use color_eyre::eyre::Result;
 use serde::Deserialize;
+use std::time::Duration;
 
 const BASE: &str = "https://api.modrinth.com/v2";
 
@@ -21,6 +23,8 @@ struct Hit {
     versions: Vec<String>,
     slug: String,
     project_type: String,
+    #[serde(default)]
+    all_project_types: Vec<String>,
     icon_url: Option<String>,
     license: Option<String>,
     categories: Vec<String>,
@@ -29,7 +33,10 @@ struct Hit {
 
 impl ModrinthClient {
     pub async fn search(filters: &SearchFilters) -> Result<Vec<SearchResult>> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap();
         let mut query = vec![
             ("query".to_owned(), filters.query.clone()),
             ("limit".to_owned(), filters.limit.to_string()),
@@ -67,13 +74,17 @@ impl ModrinthClient {
             .hits
             .into_iter()
             .map(|h| {
-                let (loaders, _cats): (Vec<_>, Vec<_>) = h.categories.into_iter().partition(|c| {
-                    matches!(
-                        c.to_lowercase().as_str(),
-                        "fabric" | "forge" | "neoforge" | "quilt" | "rift"
-                    )
-                });
+                let loaders: Vec<String> = h.categories.into_iter().filter(|c| {
+                    filters::LOADERS.contains(&c.to_lowercase().as_str())
+                }).collect();
                 let latest = h.versions.last().cloned();
+                // Use the type that matches the user's filter, or fall back to primary
+                let pt = filters.project_type.as_deref().unwrap_or("mod");
+                let display_type = if h.all_project_types.iter().any(|t| t == pt) {
+                    pt
+                } else {
+                    &h.project_type
+                };
                 SearchResult {
                     title: h.title,
                     author: h.author,
@@ -81,9 +92,9 @@ impl ModrinthClient {
                     downloads: h.downloads,
                     follows: h.follows,
                     platform: Platform::Modrinth,
-                    url: Some(format!("https://modrinth.com/{}/{}", h.project_type, h.slug)),
+                    url: Some(format!("https://modrinth.com/{}/{}", display_type, h.slug)),
                     icon_url: h.icon_url,
-                    project_type: h.project_type,
+                    project_type: display_type.to_string(),
                     license: h.license,
                     latest_version: latest,
                     loaders,

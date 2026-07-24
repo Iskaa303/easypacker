@@ -55,10 +55,10 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
         .into_iter()
         .filter(|r| {
             let t = r.project_type.to_lowercase();
-            let allowed = ["mod", "resourcepack", "shader", "datapack", "world"];
+            let pt = filters.project_type.as_deref().unwrap_or("mod");
+            // Keep only results matching the user's chosen type (mandatory single-select)
+            let allowed = pt.split(", ").map(|s| s.trim()).collect::<Vec<_>>();
             allowed.contains(&t.as_str())
-                && !r.title.to_lowercase().contains("modpack")
-                && !r.description.to_lowercase().contains("modpack")
         })
         .collect();
 

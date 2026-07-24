@@ -1,6 +1,7 @@
 use super::types::{CrossPlatform, Platform, SearchFilters, SearchResult};
 use color_eyre::eyre::Result;
 use serde::Deserialize;
+use std::time::Duration;
 
 const BASE: &str = "https://api.curseforge.com/v1";
 const MINECRAFT_GAME_ID: i32 = 432;
@@ -73,7 +74,6 @@ struct Links {
     website_url: Option<String>,
 }
 
-
 impl CurseForgeClient {
     pub fn new(api_key: &str) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -82,6 +82,7 @@ impl CurseForgeClient {
             reqwest::header::HeaderValue::from_str(api_key).unwrap(),
         );
         let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
             .default_headers(headers)
             .build()
             .unwrap();
@@ -107,6 +108,11 @@ impl CurseForgeClient {
                 params.push(("modLoaderType", loader_id.to_string()));
             }
         }
+        if let Some(ref pt) = filters.project_type {
+            if let Some(cid) = project_type_to_class_id(pt) {
+                params.push(("classId", cid.to_string()));
+            }
+        }
         let response = self.client.get(format!("{}/mods/search", BASE)).query(&params).send().await?;
         if !response.status().is_success() {
             let status = response.status();
@@ -123,11 +129,6 @@ impl CurseForgeClient {
         };
         let mut results: Vec<SearchResult> = Vec::new();
         for m in parsed.data {
-            let is_modpack = m.class_id.map_or(false, |cid| cid == 4474 || cid == 4475)
-                || m.categories.iter().any(|c| c.name.to_lowercase().contains("modpack") || c.name.to_lowercase() == "modpacks");
-            if is_modpack {
-                continue;
-            }
             let author = m.authors.first().map(|a| a.name.clone()).unwrap_or_default();
             let categories: Vec<String> = m.categories.iter().map(|c| c.name.clone()).collect();
             let latest_file = m.latest_files_indexes.iter().flatten().next();
@@ -167,22 +168,25 @@ impl CurseForgeClient {
 }
 
 fn project_type_from_class_id(class_id: Option<i32>, categories: &[String]) -> String {
-    if categories
-        .iter()
-        .any(|c| c.to_lowercase().contains("modpack"))
-    {
-        return "modpack".into();
-    }
     match class_id {
         Some(6) => "mod".into(),
         Some(12) => "resourcepack".into(),
-        Some(14) => "world".into(),
-        Some(17) => "datapack".into(),
-        Some(cid) if cid == 4474 || cid == 4475 => "modpack".into(),
+        Some(6945) => "datapack".into(),
+        Some(6552) => "shader".into(),
         _ => categories
             .first()
             .cloned()
             .unwrap_or_else(|| "unknown".into()),
+    }
+}
+
+fn project_type_to_class_id(pt: &str) -> Option<i32> {
+    match pt {
+        "mod" => Some(6),
+        "resourcepack" => Some(12),
+        "datapack" => Some(6945),
+        "shader" => Some(6552),
+        _ => None,
     }
 }
 

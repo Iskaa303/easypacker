@@ -288,8 +288,15 @@ fn handle_browse_key_inner(browse: &mut BrowseState, key: KeyCode) -> BrowseActi
                 return BrowseAction::None;
             }
             let idx = browse.filtered[browse.selected];
-            // Toggle selection
-            if browse.toggled.contains(&idx) {
+            if browse.kind == FilterKind::Version || browse.kind == FilterKind::Type {
+                // Single-select: press again to reset to "any"
+                if browse.toggled.contains(&idx) {
+                    browse.toggled.clear();
+                } else {
+                    browse.toggled.clear();
+                    browse.toggled.insert(idx);
+                }
+            } else if browse.toggled.contains(&idx) {
                 browse.toggled.remove(&idx);
             } else {
                 browse.toggled.insert(idx);
@@ -304,13 +311,10 @@ fn handle_browse_key_inner(browse: &mut BrowseState, key: KeyCode) -> BrowseActi
                 v.sort();
                 v
             };
-            let val = values.join(", ");
+            let _val = values.join(", ");
             let kind = browse.kind.clone();
-            if val.is_empty() {
-                BrowseAction::None
-            } else {
-                BrowseAction::Toggle(kind)
-            }
+            // Always send Toggle so the filter value gets updated (even when resetting to empty)
+            BrowseAction::Toggle(kind)
         }
         KeyCode::Tab => BrowseAction::Close,
         KeyCode::Up => {
@@ -592,13 +596,11 @@ async fn start_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sende
                 _ => None,
             };
             if let Some(mut results) = event {
-                results.retain(|r| {
-                    let t = r.project_type.to_lowercase();
-                    let allowed = ["mod", "resourcepack", "shader", "datapack", "world"];
-                    allowed.contains(&t.as_str())
-                        && !r.title.to_lowercase().contains("modpack")
-                        && !r.description.to_lowercase().contains("modpack")
-                });
+                // Keep only results matching the user's chosen type (mandatory single-select)
+                if let Some(ref pt) = filters.project_type {
+                    let allowed: Vec<&str> = pt.split(", ").map(|s| s.trim()).collect();
+                    results.retain(|r| allowed.contains(&r.project_type.to_lowercase().as_str()));
+                }
                 // Merge: if same title exists, fold in platform-specific data
                 for r in results {
                     let lower = r.title.to_lowercase();
