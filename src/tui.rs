@@ -85,7 +85,7 @@ enum Status {
 }
 
 enum AppEvent {
-    Results(Vec<SearchResult>),
+    Results { results: Vec<SearchResult>, offset: usize },
     Error(String),
     BrowseOptions { kind: FilterKind, options: Vec<String>, saved: HashSet<String> },
     IconLoaded(usize, Vec<u8>),
@@ -109,6 +109,7 @@ pub async fn run_tui(_args: Cli, mut cfg: Config) -> Result<()> {
         scroll: 0,
         selected: 0,
         browse_mode: None,
+        search_offset: 0,
         visible_count: Cell::new(0),
         filter_selected: 0,
         api_key_input: String::new(),
@@ -140,6 +141,7 @@ struct App {
     browse_mode: Option<BrowseState>,
     filter_selected: usize,
     api_key_input: String,
+    search_offset: usize,
     picker: Picker,
     proto_cache: Vec<Option<Protocol>>,
     visible_count: Cell<usize>,
@@ -185,8 +187,9 @@ async fn run(
                                     FilterKind::Type => app.filters.project_type = val,
                                     FilterKind::Platform => app.filters.platform = val,
                                 }
-                                // Auto-search when filter changes
+                                // Auto-search when filter changes (fresh search, reset offset)
                                 if !app.query.is_empty() {
+                                    app.search_offset = 0;
                                     start_search(app, cfg, tx).await;
                                 }
                             }
@@ -225,13 +228,19 @@ async fn run(
 
         if let Ok(event) = rx.try_recv() {
             match event {
-                AppEvent::Results(results) => {
-                    app.results = results;
+                AppEvent::Results { results, offset } => {
+                    if offset == 0 {
+                        app.results = results;
+                        app.scroll = 0;
+                        app.selected = 0;
+                        app.proto_cache = vec![None; app.results.len()];
+                    } else {
+                        let start = app.results.len();
+                        app.results.extend(results);
+                        app.proto_cache.extend(vec![None; app.results.len() - start]);
+                    }
                     app.status = Status::Done;
-                    app.scroll = 0;
-                    app.selected = 0;
                     app.focus = Focus::Results;
-                    app.proto_cache = vec![None; app.results.len()];
                     // Trigger icon downloads
                     let tx = tx.clone();
                     let urls: Vec<Option<String>> = app.results.iter().map(|r| r.icon_url.clone()).collect();
@@ -406,7 +415,7 @@ async fn handle_key(app: &mut App, key: KeyCode, cfg: &Config, tx: &tokio::sync:
             KeyCode::Right if app.cursor_pos < app.query.len() => app.cursor_pos += 1,
             KeyCode::Home => app.cursor_pos = 0,
             KeyCode::End => app.cursor_pos = app.query.len(),
-            KeyCode::Enter => start_search(app, cfg, tx).await,
+            KeyCode::Enter => { app.search_offset = 0; start_search(app, cfg, tx).await; }
             _ => {}
         },
         Focus::Filters => match key {
@@ -481,6 +490,10 @@ async fn handle_key(app: &mut App, key: KeyCode, cfg: &Config, tx: &tokio::sync:
                 let vis = app.visible_count.get().max(3);
                 if app.selected >= app.scroll + vis {
                     app.scroll += 1;
+                }
+                // Load more when within 5 items of the end
+                if app.selected + 5 >= app.results.len() && app.status != Status::Searching {
+                    start_search(app, cfg, tx).await;
                 }
             }
             KeyCode::PageUp => {
@@ -561,7 +574,7 @@ async fn start_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sende
         project_type: if app.filters.project_type.is_empty() { Some("mod".into()) } else { Some(app.filters.project_type.clone()) },
         sort: "relevance".into(),
         limit: 25,
-        offset: 0,
+        offset: app.search_offset,
     };
 
     let tx = tx.clone();
@@ -573,6 +586,8 @@ async fn start_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sende
         return;
     }
     let api_key = cfg.get_api_key(None).ok();
+    let current_offset = app.search_offset;
+    app.search_offset += 25;
     tokio::spawn(async move {
         let mut all: Vec<SearchResult> = Vec::new();
         for p in &platforms {
@@ -643,7 +658,7 @@ async fn start_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sende
             // errors already sent via tx
             return;
         }
-        let _ = tx.send(AppEvent::Results(all)).await;
+        let _ = tx.send(AppEvent::Results { results: all, offset: current_offset }).await;
     });
 }
 
