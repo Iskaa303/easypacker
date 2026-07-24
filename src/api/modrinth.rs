@@ -1,4 +1,4 @@
-use super::{Platform, SearchFilters, SearchResult};
+use super::types::{CrossPlatform, Platform, SearchFilters, SearchResult};
 use color_eyre::eyre::Result;
 use serde::Deserialize;
 
@@ -9,8 +9,6 @@ pub struct ModrinthClient;
 #[derive(Deserialize)]
 struct SearchResponse {
     hits: Vec<Hit>,
-    #[allow(dead_code)]
-    total_hits: u64,
 }
 
 #[derive(Deserialize)]
@@ -24,15 +22,10 @@ struct Hit {
     slug: String,
     project_type: String,
     icon_url: Option<String>,
-    #[allow(dead_code)]
-    client_side: String,
-    #[allow(dead_code)]
-    server_side: String,
     license: Option<String>,
-    #[allow(dead_code)]
-    latest_version: Option<String>,
     categories: Vec<String>,
 }
+
 
 impl ModrinthClient {
     pub async fn search(filters: &SearchFilters) -> Result<Vec<SearchResult>> {
@@ -44,7 +37,6 @@ impl ModrinthClient {
             ("index".to_owned(), normalize_sort(&filters.sort)),
         ];
 
-        // Build facets
         let mut facets: Vec<Vec<String>> = Vec::new();
 
         fn push_facet(facets: &mut Vec<Vec<String>>, prefix: &str, val: &str) {
@@ -55,7 +47,6 @@ impl ModrinthClient {
         }
 
         if let Some(ref v) = filters.version { push_facet(&mut facets, "versions", v); }
-        if let Some(ref c) = filters.category { push_facet(&mut facets, "categories", c); }
         if let Some(ref l) = filters.loader { push_facet(&mut facets, "loaders", l); }
         if let Some(ref t) = filters.project_type { push_facet(&mut facets, "project_type", t); }
 
@@ -76,7 +67,6 @@ impl ModrinthClient {
             .hits
             .into_iter()
             .map(|h| {
-                // categories includes both loaders and categories
                 let (loaders, _cats): (Vec<_>, Vec<_>) = h.categories.into_iter().partition(|c| {
                     matches!(
                         c.to_lowercase().as_str(),
@@ -90,7 +80,6 @@ impl ModrinthClient {
                     description: h.description,
                     downloads: h.downloads,
                     follows: h.follows,
-                    versions: h.versions,
                     platform: Platform::Modrinth,
                     url: Some(format!("https://modrinth.com/{}/{}", h.project_type, h.slug)),
                     icon_url: h.icon_url,
@@ -98,10 +87,7 @@ impl ModrinthClient {
                     license: h.license,
                     latest_version: latest,
                     loaders,
-                    modrinth_downloads: 0,
-                    modrinth_url: None,
-                    curseforge_downloads: 0,
-                    curseforge_url: None,
+                    cross: CrossPlatform::default(),
                 }
             })
             .collect())

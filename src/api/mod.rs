@@ -1,5 +1,7 @@
 mod curseforge;
 mod modrinth;
+pub mod types;
+pub mod filters;
 
 use crate::cli::Cli;
 use crate::config::Config;
@@ -7,45 +9,7 @@ use color_eyre::eyre::Result;
 
 pub use curseforge::CurseForgeClient;
 pub use modrinth::ModrinthClient;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Platform {
-    Modrinth,
-    CurseForge,
-}
-
-#[derive(Debug, Clone)]
-pub struct SearchFilters {
-    pub query: String,
-    pub version: Option<String>,
-    pub category: Option<String>,
-    pub loader: Option<String>,
-    pub project_type: Option<String>,
-    pub sort: String,
-    pub limit: usize,
-    pub offset: usize,
-}
-
-pub struct SearchResult {
-    pub title: String,
-    pub author: String,
-    pub description: String,
-    pub downloads: u64,
-    pub follows: u64,
-    #[allow(dead_code)]
-    pub versions: Vec<String>,
-    pub platform: Platform,
-    pub url: Option<String>,
-    pub icon_url: Option<String>,
-    pub project_type: String,
-    pub license: Option<String>,
-    pub latest_version: Option<String>,
-    pub loaders: Vec<String>,
-    pub modrinth_downloads: u64,
-    pub modrinth_url: Option<String>,
-    pub curseforge_downloads: u64,
-    pub curseforge_url: Option<String>,
-}
+pub use types::{Platform, SearchFilters, SearchResult};
 
 pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
     let platform = if args.cf {
@@ -57,7 +21,6 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
     let filters = SearchFilters {
         query: args.query.clone().unwrap_or_default(),
         version: args.version.clone(),
-        category: args.category.clone(),
         loader: args.loader.clone(),
         project_type: args.r#type.clone().or(Some("mod".into())),
         sort: args.sort.clone(),
@@ -71,14 +34,19 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
             match cfg.get_api_key(args.api_key.as_deref()) {
                 Ok(key) => CurseForgeClient::new(&key).search(&filters).await?,
                 Err(_) => {
-                    eprintln!("CurseForge API key not found.");
-                    eprintln!("Set it via:");
-                    eprintln!("  --api-key <key>");
-                    eprintln!("  export CURSEFORGE_API_KEY=<key>");
-                    eprintln!("  or echo '{{\"curseforge_api_key\":\"...\"}}' > ~/.easypacker.json");
-                    eprintln!();
-                    eprintln!("Get a key at: https://console.curseforge.com/");
-                    std::process::exit(1);
+                    eprintln!("CurseForge API key needed.");
+                    eprintln!("Get a free key at: https://console.curseforge.com/");
+                    eprint!("Paste your API key: ");
+                    use std::io::Write;
+                    std::io::stderr().flush().ok();
+                    let key = rpassword::read_password()?;
+                    if key.is_empty() {
+                        return Err(color_eyre::eyre::eyre!("No API key entered."));
+                    }
+                    if let Err(e) = (Config { curseforge_api_key: Some(key.clone()) }).save() {
+                        eprintln!("Warning: could not save API key: {e}");
+                    }
+                    CurseForgeClient::new(&key).search(&filters).await?
                 }
             }
         }

@@ -1,4 +1,4 @@
-use super::{Platform, SearchFilters, SearchResult};
+use super::types::{CrossPlatform, Platform, SearchFilters, SearchResult};
 use color_eyre::eyre::Result;
 use serde::Deserialize;
 
@@ -6,24 +6,17 @@ const BASE: &str = "https://api.curseforge.com/v1";
 const MINECRAFT_GAME_ID: i32 = 432;
 
 pub struct CurseForgeClient {
-    #[allow(dead_code)]
-    api_key: String,
     client: reqwest::Client,
 }
 
 #[derive(Deserialize)]
 struct SearchResponse {
     data: Vec<ModData>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    pagination: Option<Pagination>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModData {
-    #[allow(dead_code)]
-    id: u64,
     name: String,
     slug: String,
     summary: String,
@@ -65,7 +58,6 @@ struct ModLoader {
 struct LatestFileIndex {
     #[serde(rename = "gameVersion")]
     game_version: Option<String>,
-    #[allow(dead_code)]
     #[serde(default, rename = "modLoader")]
     mod_loader: Option<i32>,
 }
@@ -81,12 +73,6 @@ struct Links {
     website_url: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Pagination {
-    #[allow(dead_code)]
-    total_count: u64,
-}
 
 impl CurseForgeClient {
     pub fn new(api_key: &str) -> Self {
@@ -99,10 +85,7 @@ impl CurseForgeClient {
             .default_headers(headers)
             .build()
             .unwrap();
-        Self {
-            api_key: api_key.to_owned(),
-            client,
-        }
+        Self { client }
     }
 
     pub async fn search(&self, filters: &SearchFilters) -> Result<Vec<SearchResult>> {
@@ -150,11 +133,11 @@ impl CurseForgeClient {
             let latest_file = m.latest_files_indexes.iter().flatten().next();
             let versions: Vec<String> = m.game_versions.clone().unwrap_or_default();
             let mut loaders: Vec<String> = m
-.mod_loaders
-.iter()
-.flatten()
-.filter_map(|ml| ml.name.as_ref().map(|n| n.split('-').next().unwrap_or(n).to_lowercase()))
-.collect();
+                .mod_loaders
+                .iter()
+                .flatten()
+                .filter_map(|ml| ml.name.as_ref().map(|n| n.split('-').next().unwrap_or(n).to_lowercase()))
+                .collect();
             if loaders.is_empty() {
                 if let Some(id) = latest_file.and_then(|f| f.mod_loader) {
                     if let Some(name) = mod_loader_id_to_name(id) {
@@ -168,7 +151,6 @@ impl CurseForgeClient {
                 description: m.summary,
                 downloads: m.downloads,
                 follows: 0,
-                versions: versions.clone(),
                 platform: Platform::CurseForge,
                 url: m.links.and_then(|l| l.website_url).or(Some(format!("https://www.curseforge.com/minecraft/mc-mods/{}", m.slug))),
                 icon_url: m.logo.and_then(|l| l.url),
@@ -176,10 +158,7 @@ impl CurseForgeClient {
                 license: None,
                 latest_version: latest_file.and_then(|f| f.game_version.clone()).or_else(|| versions.first().cloned()),
                 loaders,
-                modrinth_downloads: 0,
-                modrinth_url: None,
-                curseforge_downloads: 0,
-                curseforge_url: None,
+                cross: CrossPlatform::default(),
             });
         }
         results.sort_by(|a, b| b.downloads.cmp(&a.downloads));
@@ -204,18 +183,6 @@ fn project_type_from_class_id(class_id: Option<i32>, categories: &[String]) -> S
             .first()
             .cloned()
             .unwrap_or_else(|| "unknown".into()),
-    }
-}
-
-#[allow(dead_code)]
-fn class_id_for_type(t: &str) -> Option<i32> {
-    match t.to_lowercase().as_str() {
-        "mod" | "mc-mods" => Some(6),
-        "resourcepack" | "resource-pack" | "resource_pack" | "texture-pack" => Some(12),
-        "world" | "worlds" => Some(14),
-        "datapack" | "data-pack" | "data_pack" => Some(17),
-        "addon" | "add-on" => Some(4550),
-        _ => None,
     }
 }
 

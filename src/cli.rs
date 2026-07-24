@@ -19,10 +19,6 @@ pub struct Cli {
     #[arg(short, long)]
     pub version: Option<String>,
 
-    /// Category filter (e.g. "Magic")
-    #[arg(short, long)]
-    pub category: Option<String>,
-
     /// Mod loader filter (fabric, forge, neoforge, quilt)
     #[arg(short, long)]
     pub loader: Option<String>,

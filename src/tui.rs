@@ -13,6 +13,7 @@ use ratatui::Terminal;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::stdout;
 use std::time::Duration;
@@ -29,7 +30,6 @@ enum Focus {
 
 struct FiltersState {
     version: String,
-    category: String,
     loader: String,
     project_type: String,
     platform: String,
@@ -39,7 +39,6 @@ impl Default for FiltersState {
     fn default() -> Self {
         Self {
             version: String::new(),
-            category: String::new(),
             loader: String::new(),
             project_type: "mod".into(),
             platform: "modrinth, curseforge".into(),
@@ -50,7 +49,6 @@ impl Default for FiltersState {
 #[derive(Clone, PartialEq)]
 enum FilterKind {
     Version,
-    Category,
     Loader,
     Type,
     Platform,
@@ -60,7 +58,6 @@ impl FilterKind {
     fn label(&self) -> &str {
         match self {
             FilterKind::Version => "Version",
-            FilterKind::Category => "Category",
             FilterKind::Loader => "Loader",
             FilterKind::Type => "Type",
             FilterKind::Platform => "Platform",
@@ -75,6 +72,7 @@ struct BrowseState {
     filter_text: String,
     selected: usize,
     toggled: HashSet<usize>,
+    scroll: usize,
 }
 
 #[derive(PartialEq)]
@@ -111,6 +109,7 @@ pub async fn run_tui(_args: Cli, mut cfg: Config) -> Result<()> {
         scroll: 0,
         selected: 0,
         browse_mode: None,
+        visible_count: Cell::new(0),
         filter_selected: 0,
         api_key_input: String::new(),
         picker: Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()),
@@ -143,6 +142,7 @@ struct App {
     api_key_input: String,
     picker: Picker,
     proto_cache: Vec<Option<Protocol>>,
+    visible_count: Cell<usize>,
 }
 
 async fn run(
@@ -181,7 +181,6 @@ async fn run(
                                 };
                                 match kind {
                                     FilterKind::Version => app.filters.version = val,
-                                    FilterKind::Category => app.filters.category = val,
                                     FilterKind::Loader => app.filters.loader = val,
                                     FilterKind::Type => app.filters.project_type = val,
                                     FilterKind::Platform => app.filters.platform = val,
@@ -250,6 +249,7 @@ async fn run(
                             browse.options = options;
                             browse.filtered = (0..browse.options.len()).collect();
                             browse.selected = 0;
+                            browse.scroll = 0;
                             browse.toggled = saved.iter().filter_map(|s| browse.options.iter().position(|o| o == s)).collect();
                         }
                     }
@@ -317,12 +317,19 @@ fn handle_browse_key_inner(browse: &mut BrowseState, key: KeyCode) -> BrowseActi
             if browse.selected > 0 {
                 browse.selected -= 1;
             }
+            if browse.selected < browse.scroll {
+                browse.scroll = browse.selected;
+            }
             BrowseAction::None
         }
         KeyCode::Down => {
             let max = browse.filtered.len().saturating_sub(1);
             if browse.selected < max {
                 browse.selected += 1;
+            }
+            let visible = browse.filtered.len().min(15).max(5);
+            if browse.selected >= browse.scroll + visible - 1 {
+                browse.scroll += 1;
             }
             BrowseAction::None
         }
@@ -392,20 +399,19 @@ async fn handle_key(app: &mut App, key: KeyCode, cfg: &Config, tx: &tokio::sync:
             _ => {}
         },
         Focus::Filters => match key {
-            KeyCode::Down => app.filter_selected = app.filter_selected.saturating_add(1).min(4),
+            KeyCode::Down => app.filter_selected = app.filter_selected.saturating_add(1).min(3),
             KeyCode::Up => app.filter_selected = app.filter_selected.saturating_sub(1),
             KeyCode::Enter => {
                 let kind = match app.filter_selected {
                     0 => FilterKind::Version,
-                    1 => FilterKind::Category,
-                    2 => FilterKind::Loader,
-                    3 => FilterKind::Type,
+                    1 => FilterKind::Loader,
+                    2 => FilterKind::Type,
+                    3 => FilterKind::Platform,
                     _ => FilterKind::Platform,
                 };
                 // Pre-populate toggled from current filter value
                 let current_val = match &kind {
                     FilterKind::Version => &app.filters.version,
-                    FilterKind::Category => &app.filters.category,
                     FilterKind::Loader => &app.filters.loader,
                     FilterKind::Type => &app.filters.project_type,
                     FilterKind::Platform => &app.filters.platform,
@@ -418,37 +424,35 @@ async fn handle_key(app: &mut App, key: KeyCode, cfg: &Config, tx: &tokio::sync:
                     filter_text: String::new(),
                     selected: 0,
                     toggled: HashSet::new(),
+                    scroll: 0,
                 });
-                let tx = tx.clone();
-                let platforms = app.filters.platform.clone();
-                let api_key = cfg.get_api_key(None).ok().map(|k| k.clone());
-                tokio::spawn(async move {
-                    let options = fetch_options(&kind, &platforms, api_key.as_deref()).await.unwrap_or_default();
-                    let _ = tx.send(AppEvent::BrowseOptions { kind, options, saved }).await;
-                });
+                let options: Vec<String> = match kind {
+                    FilterKind::Version => crate::api::filters::VERSIONS.iter().map(|s| s.to_string()).collect(),
+                    FilterKind::Loader => crate::api::filters::LOADERS.iter().map(|s| s.to_string()).collect(),
+                    FilterKind::Type => crate::api::filters::TYPES.iter().map(|s| s.to_string()).collect(),
+                    FilterKind::Platform => vec!["modrinth".into(), "curseforge".into()],
+                };
+                let _ = tx.try_send(AppEvent::BrowseOptions { kind, options, saved });
             }
             KeyCode::Char(c) => match app.filter_selected {
                 0 => app.filters.version.push(c),
-                1 => app.filters.category.push(c),
-                2 => app.filters.loader.push(c),
-                3 => app.filters.project_type.push(c),
-                4 => app.filters.platform.push(c),
+                1 => app.filters.loader.push(c),
+                2 => app.filters.project_type.push(c),
+                3 => app.filters.platform.push(c),
                 _ => {}
             },
             KeyCode::Backspace => match app.filter_selected {
                 0 => { let _ = app.filters.version.pop(); }
-                1 => { let _ = app.filters.category.pop(); }
-                2 => { let _ = app.filters.loader.pop(); }
-                3 => { let _ = app.filters.project_type.pop(); }
-                4 => { let _ = app.filters.platform.pop(); }
+                1 => { let _ = app.filters.loader.pop(); }
+                2 => { let _ = app.filters.project_type.pop(); }
+                3 => { let _ = app.filters.platform.pop(); }
                 _ => {}
             },
             KeyCode::Delete => match app.filter_selected {
                 0 => { let _ = app.filters.version.pop(); }
-                1 => { let _ = app.filters.category.pop(); }
-                2 => { let _ = app.filters.loader.pop(); }
-                3 => { let _ = app.filters.project_type.pop(); }
-                4 => { let _ = app.filters.platform.pop(); }
+                1 => { let _ = app.filters.loader.pop(); }
+                2 => { let _ = app.filters.project_type.pop(); }
+                3 => { let _ = app.filters.platform.pop(); }
                 _ => {}
             },
             _ => {}
@@ -463,7 +467,8 @@ async fn handle_key(app: &mut App, key: KeyCode, cfg: &Config, tx: &tokio::sync:
             KeyCode::Down => {
                 let max = app.results.len().saturating_sub(1);
                 app.selected = app.selected.saturating_add(1).min(max);
-                if app.selected >= app.scroll + 10 {
+                let vis = app.visible_count.get().max(3);
+                if app.selected >= app.scroll + vis {
                     app.scroll += 1;
                 }
             }
@@ -474,8 +479,9 @@ async fn handle_key(app: &mut App, key: KeyCode, cfg: &Config, tx: &tokio::sync:
             KeyCode::PageDown => {
                 let max = app.results.len().saturating_sub(1);
                 app.selected = app.selected.saturating_add(10).min(max);
-                if app.selected >= app.scroll + 10 {
-                    app.scroll = app.selected.saturating_sub(9);
+                let vis = app.visible_count.get().max(3);
+                if app.selected >= app.scroll + vis {
+                    app.scroll = app.selected.saturating_sub(vis.saturating_sub(1));
                 }
             }
             KeyCode::Home => {
@@ -540,7 +546,6 @@ async fn start_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sende
     let filters = SearchFilters {
         query: app.query.clone(),
         version: if app.filters.version.is_empty() { None } else { Some(app.filters.version.clone()) },
-        category: if app.filters.category.is_empty() { None } else { Some(app.filters.category.clone()) },
         loader: if app.filters.loader.is_empty() { None } else { Some(app.filters.loader.clone()) },
         project_type: if app.filters.project_type.is_empty() { Some("mod".into()) } else { Some(app.filters.project_type.clone()) },
         sort: "relevance".into(),
@@ -549,9 +554,14 @@ async fn start_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sende
     };
 
     let tx = tx.clone();
-    let api_key = cfg.get_api_key(None).ok();
     let platforms: Vec<String> = app.filters.platform.split(", ").map(|s| s.to_string()).collect();
 
+    // Prompt for API key if CurseForge selected but no key configured
+    if cfg.get_api_key(None).is_err() && platforms.iter().any(|p| p == "curseforge") {
+        app.status = Status::ApiKeyPrompt;
+        return;
+    }
+    let api_key = cfg.get_api_key(None).ok();
     tokio::spawn(async move {
         let mut all: Vec<SearchResult> = Vec::new();
         for p in &platforms {
@@ -595,24 +605,24 @@ async fn start_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sende
                     if let Some(existing) = all.iter_mut().find(|e| e.title.to_lowercase() == lower) {
                         match r.platform {
                             Platform::Modrinth => {
-                                existing.modrinth_downloads = r.downloads;
-                                existing.modrinth_url = r.url;
+                                existing.cross.modrinth_downloads = r.downloads;
+                                existing.cross.modrinth_url = r.url;
                             }
                             Platform::CurseForge => {
-                                existing.curseforge_downloads = r.downloads;
-                                existing.curseforge_url = r.url;
+                                existing.cross.curseforge_downloads = r.downloads;
+                                existing.cross.curseforge_url = r.url;
                             }
                         }
                     } else {
                         let mut entry = r;
                         match entry.platform {
                             Platform::Modrinth => {
-                                entry.modrinth_downloads = entry.downloads;
-                                entry.modrinth_url = entry.url.clone();
+                                entry.cross.modrinth_downloads = entry.downloads;
+                                entry.cross.modrinth_url = entry.url.clone();
                             }
                             Platform::CurseForge => {
-                                entry.curseforge_downloads = entry.downloads;
-                                entry.curseforge_url = entry.url.clone();
+                                entry.cross.curseforge_downloads = entry.downloads;
+                                entry.cross.curseforge_url = entry.url.clone();
                             }
                         }
                         all.push(entry);
@@ -626,101 +636,6 @@ async fn start_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sende
         }
         let _ = tx.send(AppEvent::Results(all)).await;
     });
-}
-
-async fn fetch_options(kind: &FilterKind, _platforms: &str, api_key: Option<&str>) -> Result<Vec<String>> {
-    match kind {
-        FilterKind::Platform => Ok(vec!["modrinth".into(), "curseforge".into()]),
-        FilterKind::Version | FilterKind::Category | FilterKind::Loader | FilterKind::Type => {
-            // Try each active platform for options
-            for p in _platforms.split(", ") {
-                match p {
-                    "modrinth" => match fetch_modrinth_options(kind).await {
-                        Ok(opts) if !opts.is_empty() => return Ok(opts),
-                        _ => {}
-                    },
-                    "curseforge" => {
-                        let opts = fetch_curseforge_options(kind, api_key).await;
-                        if !opts.is_empty() {
-                            return Ok(opts);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(vec![])
-        }
-    }
-}
-
-async fn fetch_modrinth_options(kind: &FilterKind) -> Result<Vec<String>> {
-    let client = reqwest::Client::new();
-    match kind {
-        FilterKind::Version => {
-            let resp: Vec<serde_json::Value> = client
-                .get("https://api.modrinth.com/v2/tag/game_version")
-                .send()
-                .await?
-                .json()
-                .await?;
-            let mut versions: Vec<String> = resp
-                .into_iter()
-                .filter_map(|v| v["version"].as_str().map(String::from))
-                .collect();
-            versions.reverse();
-            Ok(versions)
-        }
-        FilterKind::Category => {
-            let resp: Vec<serde_json::Value> = client
-                .get("https://api.modrinth.com/v2/tag/category")
-                .send()
-                .await?
-                .json()
-                .await?;
-            let mut seen = std::collections::HashSet::new();
-            let cats: Vec<String> = resp
-                .into_iter()
-                .filter_map(|c| c["name"].as_str().map(String::from))
-                .filter(|n| seen.insert(n.clone()))
-                .collect();
-            Ok(cats)
-        }
-        FilterKind::Loader => {
-            let resp: Vec<serde_json::Value> = client
-                .get("https://api.modrinth.com/v2/tag/loader")
-                .send()
-                .await?
-                .json()
-                .await?;
-            Ok(resp
-                .into_iter()
-                .filter_map(|l| l["name"].as_str().map(String::from))
-                .collect())
-        }
-        FilterKind::Type => Ok(vec![
-            "mod".into(),
-            "resourcepack".into(),
-            "shader".into(),
-            "datapack".into(),
-        ]),
-        FilterKind::Platform => Ok(vec![]),
-    }
-}
-
-async fn fetch_curseforge_options(kind: &FilterKind, _api_key: Option<&str>) -> Vec<String> {
-    match kind {
-        FilterKind::Version => {
-            vec!["26.2", "26.1.2", "26.1.1", "26.1", "1.21.11", "1.21.10", "1.21.9", "1.21.8", "1.21.7", "1.21.6", "1.21.5", "1.21.4", "1.21.3", "1.21.2", "1.21.1", "1.21", "1.20.6", "1.20.5", "1.20.4", "1.20.3", "1.20.2", "1.20.1", "1.20", "1.19.4", "1.19.3", "1.19.2", "1.19.1", "1.19", "1.18.2", "1.18.1", "1.18", "1.17.1", "1.17", "1.16.5", "1.16.4", "1.16.3", "1.16.2", "1.16.1", "1.16", "1.15.2", "1.15.1", "1.15", "1.14.4", "1.14.3", "1.14.2", "1.14.1", "1.14", "1.13.2", "1.13.1", "1.13", "1.12.2", "1.12.1", "1.12", "1.11.2", "1.11.1", "1.11", "1.10.2", "1.10.1", "1.10", "1.9.4", "1.9.3", "1.9.2", "1.9.1", "1.9", "1.8.9", "1.8.8", "1.8.7", "1.8.6", "1.8.5", "1.8.4", "1.8.3", "1.8.2", "1.8.1", "1.8", "1.7.10", "1.7.9", "1.7.8", "1.7.7", "1.7.6", "1.7.5", "1.7.4", "1.7.3", "1.7.2", "1.7.1", "1.7", "1.6.4", "1.6.2", "1.6.1", "1.6", "1.5.3", "1.5.2", "1.5.1", "1.5.0", "1.4.7", "1.4.6", "1.4.5", "1.4.4", "1.4.2", "1.3.2", "1.3.1", "1.2.8", "1.2.5", "1.2.4", "1.2.3", "1.2.2", "1.2.1", "1.2", "1.1", "1.0.0", "1.0", "0.16"]
-.iter().map(|s| s.to_string()).collect()
-        }
-        FilterKind::Category => {
-            vec!["Addons", "Applied Energistics 2", "Blood Magic", "Buildcraft", "CraftTweaker", "Create", "Farmer\'s Delight", "Forestry", "Galacticraft", "Industrial Craft", "Integrated Dynamics", "KubeJS", "Refined Storage", "Skyblock", "Thaumcraft", "Thermal Expansion", "Tinker\'s Construct", "Twilight Forest", "Adventure and RPG", "API and Library", "Armor Tools and Weapons", "Bug Fixes", "Cosmetic", "CreativeMode", "Education", "Food", "Horror", "Magic", "Map and Information", "MCreator", "Miscellaneous", "ModJam 2025", "Performance", "Redstone", "Server Utility", "Storage", "Technology", "Automation", "Energy", "Energy Fluid and Item Transport", "Farming", "Genetics", "Player Transport", "Processing", "Twitch Integration", "Utility and QoL", "World Gen", "Biomes", "Dimensions", "Mobs", "Ores and Resources", "Structures"]
-.iter().map(|s| s.to_string()).collect()
-        }
-        FilterKind::Loader => vec!["forge".into(), "fabric".into(), "neoforge".into(), "quilt".into()],
-        FilterKind::Type => vec!["mod".into(), "resourcepack".into(), "datapack".into()],
-        FilterKind::Platform => vec![],
-    }
 }
 
 fn render(frame: &mut ratatui::Frame, app: &App) {
@@ -810,21 +725,24 @@ fn render_browse(frame: &mut ratatui::Frame, area: Rect, browse: &BrowseState) {
         return;
     }
 
-    let filter_display = if browse.filter_text.is_empty() {
+    let _filter_display = if browse.filter_text.is_empty() {
         " type to filter…"
     } else {
-        // Need to stash the string
         Box::leak(Box::new(format!(" filter: {} ", browse.filter_text)))
     };
 
-    let items: Vec<ListItem> = browse
-        .filtered
+    let list_h = area.height.saturating_sub(2) as usize;
+    let slice_start = browse.scroll.min(browse.filtered.len().saturating_sub(1));
+    let visible: &[usize] = &browse.filtered[slice_start..];
+    let vis_count = visible.len().min(list_h);
+
+    let items: Vec<ListItem> = visible[..vis_count]
         .iter()
         .enumerate()
         .map(|(i, opt_idx)| {
             let opt = &browse.options[*opt_idx];
             let checked = if browse.toggled.contains(opt_idx) { "[x]" } else { "[ ]" };
-            let selected = i == browse.selected;
+            let selected = slice_start + i == browse.selected;
             let prefix = if selected { "▸ " } else { "  " };
             let style = if selected {
                 Style::default().bg(Color::Blue).fg(Color::White)
@@ -838,20 +756,8 @@ fn render_browse(frame: &mut ratatui::Frame, area: Rect, browse: &BrowseState) {
         })
         .collect();
 
-    // Show header with filter text
-    let top_area = Rect::new(area.x, area.y, area.width, 1);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            filter_display,
-            Style::default().fg(Color::Yellow),
-        )))
-        .block(Block::default()),
-        top_area,
-    );
-
     let list_area = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title.as_str()));
-
     frame.render_widget(list, list_area);
 }
 
@@ -932,10 +838,9 @@ fn render_filters(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 
     let lines = vec![
         filter_line("Version", &app.filters.version, focused, app.filter_selected == 0),
-        filter_line("Category", &app.filters.category, focused, app.filter_selected == 1),
-        filter_line("Loader", &app.filters.loader, focused, app.filter_selected == 2),
-        filter_line("Type", &app.filters.project_type, focused, app.filter_selected == 3),
-        filter_line("Platform", &app.filters.platform, focused, app.filter_selected == 4),
+        filter_line("Loader", &app.filters.loader, focused, app.filter_selected == 1),
+        filter_line("Type", &app.filters.project_type, focused, app.filter_selected == 2),
+        filter_line("Platform", &app.filters.platform, focused, app.filter_selected == 3),
     ];
 
     frame.render_widget(
@@ -1007,6 +912,9 @@ fn render_results(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     frame.render_widget(&block, area);
 
     let max_visible = (inner.height as usize).saturating_div(3).min(app.results.len().saturating_sub(app.scroll));
+    app.visible_count.set(max_visible);
+    // Cast to non-const to satisfy const-ref, store for scroll threshold
+    let _ = max_visible;
     for vis in 0..max_visible {
         let idx = app.scroll + vis;
         if idx >= app.results.len() { break; }
@@ -1044,15 +952,15 @@ fn render_results(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 
         // Build platform badges
         let mut badges = String::new();
-        if r.modrinth_downloads > 0 || r.modrinth_url.is_some() { badges.push_str("[M] "); }
-        if r.curseforge_downloads > 0 || r.curseforge_url.is_some() { badges.push_str("[C] "); }
+        if r.cross.modrinth_downloads > 0 || r.cross.modrinth_url.is_some() { badges.push_str("[M] "); }
+        if r.cross.curseforge_downloads > 0 || r.cross.curseforge_url.is_some() { badges.push_str("[C] "); }
         // Build stats line
         let mut stats_parts: Vec<String> = Vec::new();
-        if r.modrinth_downloads > 0 {
-            stats_parts.push(format!("M:{}↓", r.modrinth_downloads));
+        if r.cross.modrinth_downloads > 0 {
+            stats_parts.push(format!("M:{}↓", r.cross.modrinth_downloads));
         }
-        if r.curseforge_downloads > 0 {
-            stats_parts.push(format!("C:{}↓", r.curseforge_downloads));
+        if r.cross.curseforge_downloads > 0 {
+            stats_parts.push(format!("C:{}↓", r.cross.curseforge_downloads));
         }
         if stats_parts.is_empty() {
             stats_parts.push(format!("{}↓", r.downloads));
@@ -1077,8 +985,8 @@ fn render_results(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         ]);
         // Build URL line — show both platform URLs if available
         let mut url_parts: Vec<String> = Vec::new();
-        if let Some(ref u) = r.modrinth_url { url_parts.push(format!("M: {u}")); }
-        if let Some(ref u) = r.curseforge_url { url_parts.push(format!("C: {u}")); }
+        if let Some(ref u) = r.cross.modrinth_url { url_parts.push(format!("M: {u}")); }
+        if let Some(ref u) = r.cross.curseforge_url { url_parts.push(format!("C: {u}")); }
         if url_parts.is_empty() {
             if let Some(ref u) = r.url { url_parts.push(u.clone()); }
         }
