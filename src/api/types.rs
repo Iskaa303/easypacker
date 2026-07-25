@@ -50,4 +50,8 @@ pub struct ProjectFile {
     pub downloads: u64,
     pub url: Option<String>,
     pub platforms: Vec<Platform>,
+    pub modrinth_version_id: Option<String>,
+    pub modrinth_url: Option<String>,
+    pub curseforge_file_id: Option<i32>,
+    pub curseforge_url: Option<String>,
 }

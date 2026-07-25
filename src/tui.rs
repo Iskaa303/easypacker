@@ -116,6 +116,51 @@ async fn run(
                             app.mode = AppMode::Search;
                             app.file_browse = None;
                         }
+                        KeyCode::Enter => {
+                            if let Some(ref mut fb) = app.file_browse {
+                                if fb.selected < fb.files.len() {
+                                    let f = &fb.files[fb.selected];
+                                    let cwd = std::env::current_dir().unwrap_or_default();
+                                    let mut pf = project::ProjectsFile::load(&cwd);
+                                    if !pf.contains(
+                                        &fb.project_type,
+                                        fb.modrinth_slug.as_deref(),
+                                        fb.curseforge_id,
+                                    ) {
+                                        let modrinth = f.modrinth_version_id.is_some().then(|| {
+                                            project::ModrinthMeta {
+                                                slug: fb.modrinth_slug.clone().unwrap_or_default(),
+                                                version_id: f
+                                                    .modrinth_version_id
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                                url: f.modrinth_url.clone(),
+                                            }
+                                        });
+                                        let curseforge =
+                                            f.curseforge_file_id.is_some().then(|| {
+                                                project::CurseForgeMeta {
+                                                    mod_id: fb.curseforge_id.unwrap_or(0),
+                                                    file_id: f.curseforge_file_id.unwrap_or(0),
+                                                    url: f.curseforge_url.clone(),
+                                                }
+                                            });
+                                        let entry = project::ProjectEntry {
+                                            name: fb.project_title.clone(),
+                                            project_type: fb.project_type.clone(),
+                                            loaders: f.loaders.clone(),
+                                            mc_versions: f.mc_versions.clone(),
+                                            version_name: f.name.clone(),
+                                            modrinth,
+                                            curseforge,
+                                        };
+                                        pf.add(entry);
+                                        let _ = pf.save(&cwd);
+                                        fb.already_added = true;
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     },
                 }
@@ -168,12 +213,23 @@ async fn run(
                 AppEvent::FileResults {
                     files,
                     project_title,
+                    modrinth_slug,
+                    curseforge_id,
+                    project_type,
                 } => {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let pf = project::ProjectsFile::load(&cwd);
+                    let already =
+                        pf.contains(&project_type, modrinth_slug.as_deref(), curseforge_id);
                     app.file_browse = Some(FileBrowseState {
                         project_title,
+                        modrinth_slug,
+                        curseforge_id,
+                        project_type,
                         files,
                         scroll: 0,
                         selected: 0,
+                        already_added: already,
                     });
                     app.mode = AppMode::FileBrowse;
                 }

@@ -440,6 +440,7 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
     };
     let modrinth_slug = r.cross.modrinth_slug.clone();
     let curseforge_id = r.cross.curseforge_id;
+    let project_type = r.project_type.clone();
     let api_key = cfg.get_api_key(None).ok();
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -447,8 +448,21 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
         if let Some(ref slug) = modrinth_slug {
             match ModrinthClient::get_versions(slug).await {
                 Ok(files) => {
-                    for f in files {
-                        let lower = f.name.to_lowercase();
+                    for mv in files {
+                        let pf = ProjectFile {
+                            name: mv.name,
+                            mc_versions: mv.game_versions,
+                            loaders: mv.loaders,
+                            date_published: mv.date_published,
+                            downloads: mv.downloads,
+                            url: mv.url.clone(),
+                            platforms: vec![Platform::Modrinth],
+                            modrinth_version_id: Some(mv.id),
+                            modrinth_url: mv.url,
+                            curseforge_file_id: None,
+                            curseforge_url: None,
+                        };
+                        let lower = pf.name.to_lowercase();
                         if let Some(existing) = all_files
                             .iter_mut()
                             .find(|e: &&mut ProjectFile| e.name.to_lowercase() == lower)
@@ -456,14 +470,18 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                             if !existing.platforms.contains(&Platform::Modrinth) {
                                 existing.platforms.push(Platform::Modrinth);
                             }
-                            if f.downloads > existing.downloads {
-                                existing.downloads = f.downloads;
+                            if pf.downloads > existing.downloads {
+                                existing.downloads = pf.downloads;
                             }
-                            if f.url.is_some() {
-                                existing.url = f.url.clone();
+                            if pf.modrinth_version_id.is_some() {
+                                existing.modrinth_version_id = pf.modrinth_version_id.clone();
+                                existing.modrinth_url = pf.modrinth_url.clone();
+                            }
+                            if pf.url.is_some() {
+                                existing.url = pf.url.clone();
                             }
                         } else {
-                            all_files.push(f);
+                            all_files.push(pf);
                         }
                     }
                 }
@@ -478,8 +496,33 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                 let client = CurseForgeClient::new(key);
                 match client.get_files(id).await {
                     Ok(files) => {
-                        for f in files {
-                            let lower = f.name.to_lowercase();
+                        for cf in files {
+                            let known: Vec<&str> = filters::LOADERS.to_vec();
+                            let loaders: Vec<String> = cf
+                                .game_versions
+                                .iter()
+                                .filter(|v| known.iter().any(|l| v.eq_ignore_ascii_case(l)))
+                                .map(|v| v.to_lowercase())
+                                .collect();
+                            let mc_versions: Vec<String> = cf
+                                .game_versions
+                                .into_iter()
+                                .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
+                                .collect();
+                            let pf = ProjectFile {
+                                name: cf.display_name,
+                                mc_versions,
+                                loaders,
+                                date_published: cf.file_date,
+                                downloads: cf.download_count,
+                                url: cf.download_url.clone(),
+                                platforms: vec![Platform::CurseForge],
+                                modrinth_version_id: None,
+                                modrinth_url: None,
+                                curseforge_file_id: Some(cf.id),
+                                curseforge_url: cf.download_url,
+                            };
+                            let lower = pf.name.to_lowercase();
                             if let Some(existing) = all_files
                                 .iter_mut()
                                 .find(|e: &&mut ProjectFile| e.name.to_lowercase() == lower)
@@ -487,14 +530,18 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                                 if !existing.platforms.contains(&Platform::CurseForge) {
                                     existing.platforms.push(Platform::CurseForge);
                                 }
-                                if f.downloads > existing.downloads {
-                                    existing.downloads = f.downloads;
+                                if pf.downloads > existing.downloads {
+                                    existing.downloads = pf.downloads;
                                 }
-                                if f.url.is_some() {
-                                    existing.url = f.url.clone();
+                                if pf.curseforge_file_id.is_some() {
+                                    existing.curseforge_file_id = pf.curseforge_file_id;
+                                    existing.curseforge_url = pf.curseforge_url.clone();
+                                }
+                                if pf.url.is_some() {
+                                    existing.url = pf.url.clone();
                                 }
                             } else {
-                                all_files.push(f);
+                                all_files.push(pf);
                             }
                         }
                     }
@@ -518,6 +565,9 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
             .send(AppEvent::FileResults {
                 files: filtered,
                 project_title,
+                modrinth_slug,
+                curseforge_id,
+                project_type,
             })
             .await;
     });
@@ -965,9 +1015,15 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
     let Some(ref fb) = app.file_browse else {
         return;
     };
+    let added = if fb.already_added {
+        " [ALREADY IN MODPACK]"
+    } else {
+        ""
+    };
     let header = format!(
-        " {} — Esc:back  ↑↓:scroll  ({})",
+        " {}{} — Esc:back  ↑↓:scroll  Enter:add  ({})",
         fb.project_title,
+        added,
         fb.files.len()
     );
     let lines: Vec<Line> = fb

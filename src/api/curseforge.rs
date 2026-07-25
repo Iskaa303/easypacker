@@ -1,5 +1,4 @@
-use super::types::{CrossPlatform, Platform, ProjectFile, SearchFilters, SearchResult};
-use crate::api::filters;
+use super::types::{CrossPlatform, Platform, SearchFilters, SearchResult};
 use color_eyre::eyre::Result;
 use serde::Deserialize;
 use std::time::Duration;
@@ -45,6 +44,7 @@ struct ModData {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CurseForgeFile {
+    id: i32,
     display_name: String,
     game_versions: Vec<String>,
     file_date: String,
@@ -56,6 +56,16 @@ struct CurseForgeFile {
 #[derive(Deserialize)]
 struct FilesResponse {
     data: Vec<CurseForgeFile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CurseForgeFileInfo {
+    pub id: i32,
+    pub display_name: String,
+    pub game_versions: Vec<String>,
+    pub file_date: String,
+    pub download_count: u64,
+    pub download_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -214,7 +224,7 @@ impl CurseForgeClient {
         Ok(results)
     }
 
-    pub async fn get_files(&self, mod_id: i32) -> Result<Vec<ProjectFile>> {
+    pub async fn get_files(&self, mod_id: i32) -> Result<Vec<CurseForgeFileInfo>> {
         let resp: FilesResponse = self
             .client
             .get(format!("{}/mods/{}/files", BASE, mod_id))
@@ -225,28 +235,13 @@ impl CurseForgeClient {
         Ok(resp
             .data
             .into_iter()
-            .map(|f| {
-                let known: Vec<&str> = filters::LOADERS.to_vec();
-                let loaders: Vec<String> = f
-                    .game_versions
-                    .iter()
-                    .filter(|v| known.iter().any(|l| v.eq_ignore_ascii_case(l)))
-                    .map(|v| v.to_lowercase())
-                    .collect();
-                let mc_versions: Vec<String> = f
-                    .game_versions
-                    .into_iter()
-                    .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
-                    .collect();
-                ProjectFile {
-                    name: f.display_name,
-                    mc_versions,
-                    loaders,
-                    date_published: f.file_date,
-                    downloads: f.download_count,
-                    url: f.download_url,
-                    platforms: vec![Platform::CurseForge],
-                }
+            .map(|f| CurseForgeFileInfo {
+                id: f.id,
+                display_name: f.display_name,
+                game_versions: f.game_versions,
+                file_date: f.file_date,
+                download_count: f.download_count,
+                download_url: f.download_url,
             })
             .collect())
     }

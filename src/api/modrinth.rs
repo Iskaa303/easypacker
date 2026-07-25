@@ -1,4 +1,4 @@
-use super::types::{CrossPlatform, Platform, ProjectFile, SearchFilters, SearchResult};
+use super::types::{CrossPlatform, Platform, SearchFilters, SearchResult};
 use crate::api::filters;
 use color_eyre::eyre::Result;
 use serde::Deserialize;
@@ -32,6 +32,7 @@ struct Hit {
 
 #[derive(Deserialize)]
 struct ModrinthVersion {
+    id: String,
     name: String,
     #[serde(rename = "game_versions")]
     game_versions: Vec<String>,
@@ -50,12 +51,24 @@ struct ModrinthVersionFile {
     primary: Option<bool>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ModrinthVersionInfo {
+    pub id: String,
+    pub name: String,
+    pub game_versions: Vec<String>,
+    pub loaders: Vec<String>,
+    pub date_published: String,
+    pub downloads: u64,
+    pub url: Option<String>,
+}
+
 impl ModrinthClient {
     pub async fn search(filters: &SearchFilters) -> Result<Vec<SearchResult>> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
         let mut query = vec![
+            ("query".to_owned(), filters.query.clone()),
             ("limit".to_owned(), filters.limit.to_string()),
             ("offset".to_owned(), filters.offset.to_string()),
             ("index".to_owned(), normalize_sort(&filters.sort)),
@@ -137,7 +150,7 @@ impl ModrinthClient {
             .collect())
     }
 
-    pub async fn get_versions(slug: &str) -> Result<Vec<ProjectFile>> {
+    pub async fn get_versions(slug: &str) -> Result<Vec<ModrinthVersionInfo>> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
@@ -155,14 +168,14 @@ impl ModrinthClient {
                     .iter()
                     .find(|f| f.primary.unwrap_or(false))
                     .or_else(|| v.files.first());
-                ProjectFile {
+                ModrinthVersionInfo {
+                    id: v.id,
                     name: v.name,
-                    mc_versions: v.game_versions,
+                    game_versions: v.game_versions,
                     loaders: v.loaders,
                     date_published: v.date_published,
                     downloads: v.downloads,
                     url: primary.and_then(|f| f.url.clone()),
-                    platforms: vec![Platform::Modrinth],
                 }
             })
             .collect())

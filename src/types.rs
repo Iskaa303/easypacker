@@ -39,9 +39,13 @@ pub(crate) struct BrowseState {
 }
 pub(crate) struct FileBrowseState {
     pub project_title: String,
+    pub modrinth_slug: Option<String>,
+    pub curseforge_id: Option<i32>,
+    pub project_type: String,
     pub files: Vec<ProjectFile>,
     pub scroll: usize,
     pub selected: usize,
+    pub already_added: bool,
 }
 pub(crate) enum BrowseAction {
     Toggle(FilterKind),
@@ -84,6 +88,9 @@ pub(crate) enum AppEvent {
     FileResults {
         files: Vec<ProjectFile>,
         project_title: String,
+        modrinth_slug: Option<String>,
+        curseforge_id: Option<i32>,
+        project_type: String,
     },
     Error(String),
     BrowseOptions {
