@@ -343,6 +343,7 @@ fn handle_menu(app: &mut App, key: KeyCode) {
     match choice {
         Some(0) => {
             app.query.clear();
+            app.cursor_pos = 0;
             app.results.clear();
             app.focus = Focus::Neutral;
             app.status = Status::Idle;
