@@ -78,7 +78,7 @@ impl ModrinthClient {
             push_facet(&mut facets, "versions", v);
         }
         if let Some(ref l) = filters.loader {
-            push_facet(&mut facets, "loaders", l);
+            push_facet(&mut facets, "categories", l);
         }
         if let Some(ref t) = filters.project_type {
             push_facet(&mut facets, "project_type", t);
