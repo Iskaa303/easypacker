@@ -339,10 +339,17 @@ pub(crate) async fn start_search(
         } else {
             Some(app.filters.version.clone())
         },
-        loader: if app.filters.loader.is_empty() {
-            None
-        } else {
-            Some(app.filters.loader.clone())
+        loader: {
+            let pt = if app.filters.project_type.is_empty() {
+                "mod"
+            } else {
+                &app.filters.project_type
+            };
+            if pt == "mod" && !app.filters.loader.is_empty() {
+                Some(app.filters.loader.clone())
+            } else {
+                None
+            }
         },
         project_type: if app.filters.project_type.is_empty() {
             Some("mod".into())
@@ -463,7 +470,11 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
     let r = &app.results[idx];
     let project_title = r.title.clone();
     let version_filter = app.filters.version.clone();
-    let loader_filter = app.filters.loader.clone();
+    let loader_filter = if r.project_type == "mod" {
+        app.filters.loader.clone()
+    } else {
+        String::new()
+    };
     let modrinth_slug = r.cross.modrinth_slug.clone();
     let curseforge_id = r.cross.curseforge_id;
     let api_key = cfg.get_api_key(None).ok();
