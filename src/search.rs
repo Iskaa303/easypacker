@@ -191,43 +191,6 @@ pub(crate) async fn handle_key(
                     saved,
                 });
             }
-            KeyCode::Char(c) => match app.filter_selected {
-                0 => app.filters.version.push(c),
-                1 => app.filters.loader.push(c),
-                2 => app.filters.project_type.push(c),
-                3 => app.filters.platform.push(c),
-                _ => {}
-            },
-            KeyCode::Backspace => match app.filter_selected {
-                0 => {
-                    let _ = app.filters.version.pop();
-                }
-                1 => {
-                    let _ = app.filters.loader.pop();
-                }
-                2 => {
-                    let _ = app.filters.project_type.pop();
-                }
-                3 => {
-                    let _ = app.filters.platform.pop();
-                }
-                _ => {}
-            },
-            KeyCode::Delete => match app.filter_selected {
-                0 => {
-                    let _ = app.filters.version.pop();
-                }
-                1 => {
-                    let _ = app.filters.loader.pop();
-                }
-                2 => {
-                    let _ = app.filters.project_type.pop();
-                }
-                3 => {
-                    let _ = app.filters.platform.pop();
-                }
-                _ => {}
-            },
             _ => {}
         },
         Focus::Results => match key {
