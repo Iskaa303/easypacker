@@ -51,6 +51,7 @@ pub async fn run_tui(_cfg: Config, project: Option<project::ModpackProject>) -> 
         menu_selection: 0,
         form: None,
         form_field_idx: None,
+        file_browse: None,
         quit_requested: false,
     };
 
@@ -88,6 +89,35 @@ async fn run(
                     AppMode::Settings | AppMode::CreateProject => {
                         handle_form_mode(app, key.code, tx).await
                     }
+                    AppMode::FileBrowse => match key.code {
+                        KeyCode::Up => {
+                            if let Some(ref mut fb) = app.file_browse {
+                                if fb.selected > 0 {
+                                    fb.selected -= 1;
+                                    if fb.selected < fb.scroll {
+                                        fb.scroll = fb.selected;
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Down => {
+                            if let Some(ref mut fb) = app.file_browse {
+                                let max = fb.files.len().saturating_sub(1);
+                                if fb.selected < max {
+                                    fb.selected += 1;
+                                }
+                                let vis = 15.min(max.saturating_add(1));
+                                if fb.selected >= fb.scroll + vis.saturating_sub(1) {
+                                    fb.scroll += 1;
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {
+                            app.mode = AppMode::Search;
+                            app.file_browse = None;
+                        }
+                        _ => {}
+                    },
                 }
                 if app.quit_requested {
                     break Ok(());
@@ -134,6 +164,18 @@ async fn run(
                     if app.mode == AppMode::Search {
                         app.status = Status::Error(msg);
                     }
+                }
+                AppEvent::FileResults {
+                    files,
+                    project_title,
+                } => {
+                    app.file_browse = Some(FileBrowseState {
+                        project_title,
+                        files,
+                        scroll: 0,
+                        selected: 0,
+                    });
+                    app.mode = AppMode::FileBrowse;
                 }
                 AppEvent::BrowseOptions {
                     kind,
@@ -191,6 +233,7 @@ fn render(frame: &mut Frame, app: &App) {
                 .unwrap_or("(no project)");
             ui::render_main_menu(frame, frame.area(), name, app.menu_selection);
         }
+        AppMode::FileBrowse => search::render_file_browse(frame, app),
         AppMode::Search => search::render_search_screen(frame, app),
         AppMode::Settings | AppMode::CreateProject => {
             if let Some(ref browse) = app.browse_mode {

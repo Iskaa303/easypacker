@@ -30,5 +30,6 @@ pub(crate) struct App {
     pub menu_selection: usize,
     pub form: Option<ui::FormState>,
     pub form_field_idx: Option<usize>,
+    pub file_browse: Option<FileBrowseState>,
     pub quit_requested: bool,
 }

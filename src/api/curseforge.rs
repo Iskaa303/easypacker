@@ -1,4 +1,5 @@
-use super::types::{CrossPlatform, Platform, SearchFilters, SearchResult};
+use super::types::{CrossPlatform, Platform, ProjectFile, SearchFilters, SearchResult};
+use crate::api::filters;
 use color_eyre::eyre::Result;
 use serde::Deserialize;
 use std::time::Duration;
@@ -18,6 +19,7 @@ struct SearchResponse {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModData {
+    id: i32,
     name: String,
     slug: String,
     summary: String,
@@ -41,6 +43,23 @@ struct ModData {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeFile {
+    display_name: String,
+    game_versions: Vec<String>,
+    file_date: String,
+    download_count: u64,
+    #[serde(default)]
+    download_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FilesResponse {
+    data: Vec<CurseForgeFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Author {
     name: String,
 }
@@ -185,11 +204,51 @@ impl CurseForgeClient {
                     .and_then(|f| f.game_version.clone())
                     .or_else(|| versions.first().cloned()),
                 loaders,
-                cross: CrossPlatform::default(),
+                cross: CrossPlatform {
+                    curseforge_id: Some(m.id),
+                    ..CrossPlatform::default()
+                },
             });
         }
         results.sort_by(|a, b| b.downloads.cmp(&a.downloads));
         Ok(results)
+    }
+
+    pub async fn get_files(&self, mod_id: i32) -> Result<Vec<ProjectFile>> {
+        let resp: FilesResponse = self
+            .client
+            .get(format!("{}/mods/{}/files", BASE, mod_id))
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(resp
+            .data
+            .into_iter()
+            .map(|f| {
+                let known: Vec<&str> = filters::LOADERS.to_vec();
+                let loaders: Vec<String> = f
+                    .game_versions
+                    .iter()
+                    .filter(|v| known.iter().any(|l| v.eq_ignore_ascii_case(l)))
+                    .map(|v| v.to_lowercase())
+                    .collect();
+                let mc_versions: Vec<String> = f
+                    .game_versions
+                    .into_iter()
+                    .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
+                    .collect();
+                ProjectFile {
+                    name: f.display_name,
+                    mc_versions,
+                    loaders,
+                    date_published: f.file_date,
+                    downloads: f.download_count,
+                    url: f.download_url,
+                    platforms: vec![Platform::CurseForge],
+                }
+            })
+            .collect())
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::api::types::SearchResult;
+use crate::api::types::{ProjectFile, SearchResult};
 use std::collections::HashSet;
 
 #[derive(PartialEq)]
@@ -37,7 +37,12 @@ pub(crate) struct BrowseState {
     pub toggled: HashSet<usize>,
     pub scroll: usize,
 }
-
+pub(crate) struct FileBrowseState {
+    pub project_title: String,
+    pub files: Vec<ProjectFile>,
+    pub scroll: usize,
+    pub selected: usize,
+}
 pub(crate) enum BrowseAction {
     Toggle(FilterKind),
     Close,
@@ -76,6 +81,10 @@ pub(crate) enum AppEvent {
         results: Vec<SearchResult>,
         offset: usize,
     },
+    FileResults {
+        files: Vec<ProjectFile>,
+        project_title: String,
+    },
     Error(String),
     BrowseOptions {
         kind: FilterKind,
@@ -84,12 +93,12 @@ pub(crate) enum AppEvent {
     },
     IconLoaded(usize, Vec<u8>),
 }
-
 #[derive(Clone, PartialEq)]
 pub(crate) enum AppMode {
     Welcome,
     MainMenu,
     Search,
+    FileBrowse,
     Settings,
     CreateProject,
 }

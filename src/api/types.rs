@@ -6,6 +6,8 @@ pub enum Platform {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct CrossPlatform {
+    pub curseforge_id: Option<i32>,
+    pub modrinth_slug: Option<String>,
     pub modrinth_downloads: u64,
     pub modrinth_url: Option<String>,
     pub curseforge_downloads: u64,
@@ -37,4 +39,15 @@ pub struct SearchResult {
     pub latest_version: Option<String>,
     pub loaders: Vec<String>,
     pub cross: CrossPlatform,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectFile {
+    pub name: String,
+    pub mc_versions: Vec<String>,
+    pub loaders: Vec<String>,
+    pub date_published: String,
+    pub downloads: u64,
+    pub url: Option<String>,
+    pub platforms: Vec<Platform>,
 }

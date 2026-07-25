@@ -1,5 +1,7 @@
 use crate::api::filters;
-use crate::api::{CurseForgeClient, ModrinthClient, Platform, SearchFilters, SearchResult};
+use crate::api::{
+    CurseForgeClient, ModrinthClient, Platform, ProjectFile, SearchFilters, SearchResult,
+};
 use crate::app::App;
 use crate::config::Config;
 use crate::types::*;
@@ -266,6 +268,12 @@ pub(crate) async fn handle_key(
                 app.selected = app.results.len().saturating_sub(1);
                 app.scroll = app.selected.saturating_sub(9);
             }
+            KeyCode::Enter => {
+                let idx = app.selected;
+                if idx < app.results.len() {
+                    start_file_fetch(app, cfg, tx).await;
+                }
+            }
             _ => {}
         },
     }
@@ -409,6 +417,9 @@ pub(crate) async fn start_search(
                             Platform::Modrinth => {
                                 existing.cross.modrinth_downloads = r.downloads;
                                 existing.cross.modrinth_url = r.url;
+                                if r.cross.modrinth_slug.is_some() {
+                                    existing.cross.modrinth_slug = r.cross.modrinth_slug.clone();
+                                }
                             }
                             Platform::CurseForge => {
                                 existing.cross.curseforge_downloads = r.downloads;
@@ -439,6 +450,100 @@ pub(crate) async fn start_search(
             .send(AppEvent::Results {
                 results: all,
                 offset: current_offset,
+            })
+            .await;
+    });
+}
+
+async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+    let idx = app.selected;
+    if idx >= app.results.len() {
+        return;
+    }
+    let r = &app.results[idx];
+    let project_title = r.title.clone();
+    let version_filter = app.filters.version.clone();
+    let loader_filter = app.filters.loader.clone();
+    let modrinth_slug = r.cross.modrinth_slug.clone();
+    let curseforge_id = r.cross.curseforge_id;
+    let api_key = cfg.get_api_key(None).ok();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let mut all_files: Vec<ProjectFile> = Vec::new();
+        if let Some(ref slug) = modrinth_slug {
+            match ModrinthClient::get_versions(slug).await {
+                Ok(files) => {
+                    for f in files {
+                        let lower = f.name.to_lowercase();
+                        if let Some(existing) = all_files
+                            .iter_mut()
+                            .find(|e: &&mut ProjectFile| e.name.to_lowercase() == lower)
+                        {
+                            if !existing.platforms.contains(&Platform::Modrinth) {
+                                existing.platforms.push(Platform::Modrinth);
+                            }
+                            if f.downloads > existing.downloads {
+                                existing.downloads = f.downloads;
+                            }
+                            if f.url.is_some() {
+                                existing.url = f.url.clone();
+                            }
+                        } else {
+                            all_files.push(f);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Modrinth get_versions error: {e}");
+                    let _ = tx.send(AppEvent::Error(format!("Modrinth: {e}"))).await;
+                }
+            }
+        }
+        if let Some(id) = curseforge_id {
+            if let Some(ref key) = api_key {
+                let client = CurseForgeClient::new(key);
+                match client.get_files(id).await {
+                    Ok(files) => {
+                        for f in files {
+                            let lower = f.name.to_lowercase();
+                            if let Some(existing) = all_files
+                                .iter_mut()
+                                .find(|e: &&mut ProjectFile| e.name.to_lowercase() == lower)
+                            {
+                                if !existing.platforms.contains(&Platform::CurseForge) {
+                                    existing.platforms.push(Platform::CurseForge);
+                                }
+                                if f.downloads > existing.downloads {
+                                    existing.downloads = f.downloads;
+                                }
+                                if f.url.is_some() {
+                                    existing.url = f.url.clone();
+                                }
+                            } else {
+                                all_files.push(f);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::Error(format!("CurseForge: {e}"))).await;
+                    }
+                }
+            }
+        }
+        let filtered: Vec<ProjectFile> = all_files
+            .into_iter()
+            .filter(|f| {
+                let mc_ok =
+                    version_filter.is_empty() || f.mc_versions.iter().any(|v| v == &version_filter);
+                let loader_ok =
+                    loader_filter.is_empty() || f.loaders.iter().any(|l| l == &loader_filter);
+                mc_ok && loader_ok
+            })
+            .collect();
+        let _ = tx
+            .send(AppEvent::FileResults {
+                files: filtered,
+                project_title,
             })
             .await;
     });
@@ -879,4 +984,80 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         ),
     };
     frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
+}
+
+pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let Some(ref fb) = app.file_browse else {
+        return;
+    };
+    let header = format!(
+        " {} — Esc:back  ↑↓:scroll  ({})",
+        fb.project_title,
+        fb.files.len()
+    );
+    let lines: Vec<Line> = fb
+        .files
+        .iter()
+        .enumerate()
+        .skip(fb.scroll)
+        .take(area.height.saturating_sub(2) as usize)
+        .map(|(i, f)| {
+            let is_sel = i == fb.selected;
+            let prefix = if is_sel { "▸ " } else { "  " };
+            let bg = if is_sel {
+                Style::default().bg(Color::Blue)
+            } else {
+                Style::default()
+            };
+            let mc = f.mc_versions.first().map(|s| s.as_str()).unwrap_or("-");
+            let loaders = f.loaders.join(", ");
+            let date = &f.date_published[..f.date_published.len().min(10)];
+            let dl = f.downloads;
+            Line::from(vec![
+                Span::styled(prefix, bg.fg(Color::Yellow)),
+                Span::styled(
+                    f.name.clone(),
+                    bg.fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  MC:{mc}"), bg.fg(Color::Yellow)),
+                Span::styled(
+                    if loaders.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {loaders}")
+                    },
+                    bg.fg(Color::Magenta),
+                ),
+                Span::styled(format!("  {date}"), bg.fg(Color::DarkGray)),
+                Span::styled(format!("  {dl}↓"), bg.fg(Color::Green)),
+                Span::styled(
+                    [
+                        if f.platforms.contains(&Platform::Modrinth) {
+                            " [M]"
+                        } else {
+                            ""
+                        },
+                        if f.platforms.contains(&Platform::CurseForge) {
+                            " [C]"
+                        } else {
+                            ""
+                        },
+                    ]
+                    .concat(),
+                    bg.fg(Color::Cyan),
+                ),
+            ])
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(header.as_str())
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }

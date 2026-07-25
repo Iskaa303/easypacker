@@ -9,7 +9,7 @@ use color_eyre::eyre::Result;
 
 pub use curseforge::CurseForgeClient;
 pub use modrinth::ModrinthClient;
-pub use types::{Platform, SearchFilters, SearchResult};
+pub use types::{Platform, ProjectFile, SearchFilters, SearchResult};
 
 pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
     let platform = if args.cf {

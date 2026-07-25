@@ -1,4 +1,4 @@
-use super::types::{CrossPlatform, Platform, SearchFilters, SearchResult};
+use super::types::{CrossPlatform, Platform, ProjectFile, SearchFilters, SearchResult};
 use crate::api::filters;
 use color_eyre::eyre::Result;
 use serde::Deserialize;
@@ -30,14 +30,32 @@ struct Hit {
     categories: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct ModrinthVersion {
+    name: String,
+    #[serde(rename = "game_versions")]
+    game_versions: Vec<String>,
+    loaders: Vec<String>,
+    #[serde(rename = "date_published")]
+    date_published: String,
+    downloads: u64,
+    #[serde(default)]
+    files: Vec<ModrinthVersionFile>,
+}
+
+#[derive(Deserialize)]
+struct ModrinthVersionFile {
+    url: Option<String>,
+    #[serde(default)]
+    primary: Option<bool>,
+}
+
 impl ModrinthClient {
     pub async fn search(filters: &SearchFilters) -> Result<Vec<SearchResult>> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap();
+            .build()?;
         let mut query = vec![
-            ("query".to_owned(), filters.query.clone()),
             ("limit".to_owned(), filters.limit.to_string()),
             ("offset".to_owned(), filters.offset.to_string()),
             ("index".to_owned(), normalize_sort(&filters.sort)),
@@ -109,7 +127,42 @@ impl ModrinthClient {
                     license: h.license,
                     latest_version: latest,
                     loaders,
-                    cross: CrossPlatform::default(),
+                    cross: CrossPlatform {
+                        curseforge_id: None,
+                        modrinth_slug: Some(h.slug.clone()),
+                        ..CrossPlatform::default()
+                    },
+                }
+            })
+            .collect())
+    }
+
+    pub async fn get_versions(slug: &str) -> Result<Vec<ProjectFile>> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()?;
+        let resp: Vec<ModrinthVersion> = client
+            .get(format!("{}/project/{}/version", BASE, slug))
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(resp
+            .into_iter()
+            .map(|v| {
+                let primary = v
+                    .files
+                    .iter()
+                    .find(|f| f.primary.unwrap_or(false))
+                    .or_else(|| v.files.first());
+                ProjectFile {
+                    name: v.name,
+                    mc_versions: v.game_versions,
+                    loaders: v.loaders,
+                    date_published: v.date_published,
+                    downloads: v.downloads,
+                    url: primary.and_then(|f| f.url.clone()),
+                    platforms: vec![Platform::Modrinth],
                 }
             })
             .collect())
