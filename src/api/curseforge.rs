@@ -46,11 +46,23 @@ struct ModData {
 struct CurseForgeFile {
     id: i32,
     display_name: String,
+    #[serde(default)]
+    file_name: String,
+    #[serde(default)]
+    file_length: u64,
     game_versions: Vec<String>,
     file_date: String,
     download_count: u64,
     #[serde(default)]
     download_url: Option<String>,
+    #[serde(default)]
+    hashes: Vec<FileHash>,
+}
+
+#[derive(Deserialize)]
+struct FileHash {
+    algo: i32,
+    value: String,
 }
 
 #[derive(Deserialize)]
@@ -62,10 +74,14 @@ struct FilesResponse {
 pub struct CurseForgeFileInfo {
     pub id: i32,
     pub display_name: String,
+    pub file_name: String,
+    pub file_length: u64,
     pub game_versions: Vec<String>,
     pub file_date: String,
     pub download_count: u64,
     pub download_url: Option<String>,
+    pub sha1: Option<String>,
+    pub md5: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -224,24 +240,78 @@ impl CurseForgeClient {
         Ok(results)
     }
 
-    pub async fn get_files(&self, mod_id: i32) -> Result<Vec<CurseForgeFileInfo>> {
+    /// Find a project by its slug. Returns (mod id, display name).
+    pub async fn find_by_slug(
+        &self,
+        slug: &str,
+        class_id: Option<i32>,
+    ) -> Result<Option<(i32, String)>> {
+        let mut params: Vec<(&str, String)> = vec![
+            ("gameId", MINECRAFT_GAME_ID.to_string()),
+            ("slug", slug.to_owned()),
+            ("pageSize", "1".to_owned()),
+        ];
+        if let Some(cid) = class_id {
+            params.push(("classId", cid.to_string()));
+        }
+        let resp: SearchResponse = self
+            .client
+            .get(format!("{}/mods/search", BASE))
+            .query(&params)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(resp.data.into_iter().next().map(|m| (m.id, m.name)))
+    }
+
+    pub async fn get_files(
+        &self,
+        mod_id: i32,
+        game_version: Option<&str>,
+        loader: Option<&str>,
+    ) -> Result<Vec<CurseForgeFileInfo>> {
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if let Some(gv) = game_version {
+            params.push(("gameVersion", gv.to_owned()));
+        }
+        if let Some(l) = loader {
+            if let Some(id) = loader_id(l) {
+                params.push(("modLoaderType", id.to_string()));
+            }
+        }
         let resp: FilesResponse = self
             .client
             .get(format!("{}/mods/{}/files", BASE, mod_id))
+            .query(&params)
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await?;
         Ok(resp
             .data
             .into_iter()
-            .map(|f| CurseForgeFileInfo {
-                id: f.id,
-                display_name: f.display_name,
-                game_versions: f.game_versions,
-                file_date: f.file_date,
-                download_count: f.download_count,
-                download_url: f.download_url,
+            .map(|f| {
+                let hash = |algo: i32| {
+                    f.hashes
+                        .iter()
+                        .find(|h| h.algo == algo)
+                        .map(|h| h.value.clone())
+                };
+                CurseForgeFileInfo {
+                    id: f.id,
+                    display_name: f.display_name,
+                    file_name: f.file_name,
+                    file_length: f.file_length,
+                    game_versions: f.game_versions,
+                    file_date: f.file_date,
+                    download_count: f.download_count,
+                    download_url: f.download_url,
+                    sha1: hash(1),
+                    md5: hash(2),
+                }
             })
             .collect())
     }
@@ -260,7 +330,7 @@ fn project_type_from_class_id(class_id: Option<i32>, categories: &[String]) -> S
     }
 }
 
-fn project_type_to_class_id(pt: &str) -> Option<i32> {
+pub(crate) fn project_type_to_class_id(pt: &str) -> Option<i32> {
     match pt {
         "mod" => Some(6),
         "resourcepack" => Some(12),

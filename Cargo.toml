@@ -31,3 +31,4 @@ color-eyre = "0.6"
 dirs = "6"
 ratatui-image = { version = "11", default-features = false }
 rpassword = "7"
+toml = "0.9"

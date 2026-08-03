@@ -14,7 +14,7 @@ use ratatui::Frame;
 use ratatui_image::picker::Picker;
 use std::io::stdout;
 
-pub async fn run_tui(_cfg: Config, project: Option<project::ModpackProject>) -> Result<()> {
+pub async fn run_tui(_cfg: Config, project: Option<project::Manifest>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
     stdout.execute(EnterAlternateScreen)?;
@@ -121,42 +121,53 @@ async fn run(
                                 if fb.selected < fb.files.len() {
                                     let f = &fb.files[fb.selected];
                                     let cwd = std::env::current_dir().unwrap_or_default();
-                                    let mut pf = project::ProjectsFile::load(&cwd);
-                                    if !pf.contains(
-                                        &fb.project_type,
-                                        fb.modrinth_slug.as_deref(),
-                                        fb.curseforge_id,
-                                    ) {
-                                        let modrinth = f.modrinth_version_id.is_some().then(|| {
-                                            project::ModrinthMeta {
-                                                slug: fb.modrinth_slug.clone().unwrap_or_default(),
-                                                version_id: f
-                                                    .modrinth_version_id
-                                                    .clone()
-                                                    .unwrap_or_default(),
-                                                url: f.modrinth_url.clone(),
+                                    if let Ok(mut manifest) = project::Manifest::load(&cwd) {
+                                        if !manifest.contains(
+                                            &fb.project_type,
+                                            fb.modrinth_slug.as_deref(),
+                                            fb.curseforge_id.map(i64::from),
+                                        ) {
+                                            let has_mr = f.modrinth_version_id.is_some()
+                                                && fb.modrinth_slug.is_some();
+                                            let has_cf = f.curseforge_file_id.is_some()
+                                                && fb.curseforge_id.is_some();
+                                            let both = has_mr && has_cf;
+                                            // Same file on both platforms => shared
+                                            // `version`, inherited per platform.
+                                            let spec =
+                                                project::ModSpec::Detailed(project::DetailedSpec {
+                                                    version: both.then(|| f.name.clone()),
+                                                    modrinth: has_mr.then(|| {
+                                                        project::ModrinthSpec {
+                                                            slug: fb.modrinth_slug.clone(),
+                                                            version: (!both)
+                                                                .then(|| f.name.clone()),
+                                                        }
+                                                    }),
+                                                    curseforge: has_cf.then(|| {
+                                                        project::CurseForgeSpec {
+                                                            project_id: fb
+                                                                .curseforge_id
+                                                                .map(i64::from),
+                                                            version: (!both)
+                                                                .then(|| f.name.clone()),
+                                                        }
+                                                    }),
+                                                });
+                                            let key = fb
+                                                .modrinth_slug
+                                                .clone()
+                                                .unwrap_or_else(|| {
+                                                    project::slugify(&fb.project_title)
+                                                });
+                                            manifest
+                                                .cat_mut(&fb.project_type)
+                                                .insert(key, spec);
+                                            if manifest.save(&cwd).is_ok() {
+                                                app.project = Some(manifest);
                                             }
-                                        });
-                                        let curseforge =
-                                            f.curseforge_file_id.is_some().then(|| {
-                                                project::CurseForgeMeta {
-                                                    mod_id: fb.curseforge_id.unwrap_or(0),
-                                                    file_id: f.curseforge_file_id.unwrap_or(0),
-                                                    url: f.curseforge_url.clone(),
-                                                }
-                                            });
-                                        let entry = project::ProjectEntry {
-                                            name: fb.project_title.clone(),
-                                            project_type: fb.project_type.clone(),
-                                            loaders: f.loaders.clone(),
-                                            mc_versions: f.mc_versions.clone(),
-                                            version_name: f.name.clone(),
-                                            modrinth,
-                                            curseforge,
-                                        };
-                                        pf.add(entry);
-                                        let _ = pf.save(&cwd);
-                                        fb.already_added = true;
+                                            fb.already_added = true;
+                                        }
                                     }
                                 }
                             }
@@ -218,9 +229,15 @@ async fn run(
                     project_type,
                 } => {
                     let cwd = std::env::current_dir().unwrap_or_default();
-                    let pf = project::ProjectsFile::load(&cwd);
-                    let already =
-                        pf.contains(&project_type, modrinth_slug.as_deref(), curseforge_id);
+                    let already = project::Manifest::load(&cwd)
+                        .map(|m| {
+                            m.contains(
+                                &project_type,
+                                modrinth_slug.as_deref(),
+                                curseforge_id.map(i64::from),
+                            )
+                        })
+                        .unwrap_or(false);
                     app.file_browse = Some(FileBrowseState {
                         project_title,
                         modrinth_slug,
@@ -285,7 +302,7 @@ fn render(frame: &mut Frame, app: &App) {
             let name = app
                 .project
                 .as_ref()
-                .map(|p| p.name.as_str())
+                .map(|p| p.project.name.as_str())
                 .unwrap_or("(no project)");
             ui::render_main_menu(frame, frame.area(), name, app.menu_selection);
         }
@@ -378,12 +395,12 @@ fn handle_welcome(app: &mut App, key: KeyCode) {
             app.mode = AppMode::CreateProject;
         }
         ui::WelcomeAction::Open(path) => {
-            if let Some(proj) = project::ModpackProject::detect(&path) {
-                app.project = Some(proj);
+            if let Some(manifest) = project::Manifest::detect(&path) {
+                app.project = Some(manifest);
                 app.mode = AppMode::MainMenu;
                 app.menu_selection = 0;
             } else {
-                app.welcome_state.error = Some("No modpack.json found at that path".into());
+                app.welcome_state.error = Some("No Easypacker.toml found at that path".into());
             }
         }
         ui::WelcomeAction::Quit => app.quit_requested = true,
@@ -406,7 +423,8 @@ fn handle_menu(app: &mut App, key: KeyCode) {
             app.search_offset = 0;
             app.scroll = 0;
             app.selected = 0;
-            if let Some(ref proj) = app.project {
+            if let Some(ref m) = app.project {
+                let proj = &m.project;
                 if !proj.minecraft.is_empty() {
                     app.filters.version = proj.minecraft.clone();
                 }
@@ -420,7 +438,8 @@ fn handle_menu(app: &mut App, key: KeyCode) {
             app.mode = AppMode::Search;
         }
         Some(1) => {
-            if let Some(ref proj) = app.project {
+            if let Some(ref m) = app.project {
+                let proj = &m.project;
                 let form = ui::new_settings_form(
                     &proj.name,
                     &proj.version,
@@ -571,20 +590,19 @@ async fn handle_form_mode(app: &mut App, key: KeyCode, _tx: &tokio::sync::mpsc::
             ui::FormAction::Save => {
                 let is_settings = app.mode == AppMode::Settings;
                 if is_settings {
-                    if let Some(ref mut proj) = app.project {
-                        apply_form_to_project(proj, form);
+                    if let Some(ref mut m) = app.project {
+                        apply_form_to_project(&mut m.project, form);
                         let cwd = std::env::current_dir().unwrap_or_default();
-                        if let Err(e) = proj.save(&cwd) {
+                        if let Err(e) = m.save(&cwd) {
                             eprintln!("Failed to save project: {e}");
                         }
                     }
                 } else {
                     let proj = form_to_project(form);
                     let dir = std::env::current_dir().unwrap_or_default();
-                    if let Err(e) = project::ModpackProject::init_project(&dir, &proj) {
-                        eprintln!("Failed to create project: {e}");
-                    } else {
-                        app.project = Some(proj);
+                    match project::Manifest::init_project(&dir, proj) {
+                        Err(e) => eprintln!("Failed to create project: {e}"),
+                        Ok(manifest) => app.project = Some(manifest),
                     }
                 }
                 app.mode = AppMode::MainMenu;

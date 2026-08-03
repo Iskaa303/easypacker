@@ -1,8 +1,17 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "easypacker", version, about = "Minecraft Modpack creator")]
+#[command(
+    name = "easypacker",
+    version,
+    about = "Minecraft Modpack creator",
+    disable_version_flag = true
+)]
 pub struct Cli {
+    /// Print easypacker version
+    #[arg(short = 'V', long = "ver", action = clap::ArgAction::Version)]
+    pub app_version: Option<bool>,
+
     /// Search query (omit to open TUI)
     #[arg(short, long)]
     pub query: Option<String>,

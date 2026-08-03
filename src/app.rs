@@ -25,7 +25,7 @@ pub(crate) struct App {
     pub visible_count: Cell<usize>,
     // Mode + project
     pub mode: AppMode,
-    pub project: Option<project::ModpackProject>,
+    pub project: Option<project::Manifest>,
     pub welcome_state: ui::WelcomeState,
     pub menu_selection: usize,
     pub form: Option<ui::FormState>,

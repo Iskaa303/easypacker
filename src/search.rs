@@ -446,7 +446,7 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
     tokio::spawn(async move {
         let mut all_files: Vec<ProjectFile> = Vec::new();
         if let Some(ref slug) = modrinth_slug {
-            match ModrinthClient::get_versions(slug).await {
+            match ModrinthClient::get_versions(slug, None, None).await {
                 Ok(files) => {
                     for mv in files {
                         let pf = ProjectFile {
@@ -494,7 +494,7 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
         if let Some(id) = curseforge_id {
             if let Some(ref key) = api_key {
                 let client = CurseForgeClient::new(key);
-                match client.get_files(id).await {
+                match client.get_files(id, None, None).await {
                     Ok(files) => {
                         for cf in files {
                             let known: Vec<&str> = filters::LOADERS.to_vec();

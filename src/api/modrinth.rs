@@ -34,6 +34,8 @@ struct Hit {
 struct ModrinthVersion {
     id: String,
     name: String,
+    #[serde(default)]
+    version_number: String,
     #[serde(rename = "game_versions")]
     game_versions: Vec<String>,
     loaders: Vec<String>,
@@ -48,18 +50,36 @@ struct ModrinthVersion {
 struct ModrinthVersionFile {
     url: Option<String>,
     #[serde(default)]
+    filename: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
     primary: Option<bool>,
+    #[serde(default)]
+    hashes: std::collections::HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+pub struct ModrinthProjectInfo {
+    pub id: String,
+    pub title: String,
+    pub slug: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct ModrinthVersionInfo {
     pub id: String,
     pub name: String,
+    pub version_number: String,
     pub game_versions: Vec<String>,
     pub loaders: Vec<String>,
     pub date_published: String,
     pub downloads: u64,
     pub url: Option<String>,
+    pub filename: String,
+    pub size: u64,
+    pub sha1: Option<String>,
+    pub sha512: Option<String>,
 }
 
 impl ModrinthClient {
@@ -150,12 +170,37 @@ impl ModrinthClient {
             .collect())
     }
 
-    pub async fn get_versions(slug: &str) -> Result<Vec<ModrinthVersionInfo>> {
+    pub async fn get_project(slug: &str) -> Result<ModrinthProjectInfo> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
+        Ok(client
+            .get(format!("{}/project/{}", BASE, slug))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    pub async fn get_versions(
+        slug: &str,
+        game_version: Option<&str>,
+        loader: Option<&str>,
+    ) -> Result<Vec<ModrinthVersionInfo>> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()?;
+        let mut query: Vec<(&str, String)> = vec![("include_changelog", "false".into())];
+        if let Some(gv) = game_version {
+            query.push(("game_versions", serde_json::to_string(&[gv])?));
+        }
+        if let Some(l) = loader {
+            query.push(("loaders", serde_json::to_string(&[l])?));
+        }
         let resp: Vec<ModrinthVersion> = client
             .get(format!("{}/project/{}/version", BASE, slug))
+            .query(&query)
             .send()
             .await?
             .json()
@@ -171,11 +216,16 @@ impl ModrinthClient {
                 ModrinthVersionInfo {
                     id: v.id,
                     name: v.name,
+                    version_number: v.version_number,
                     game_versions: v.game_versions,
                     loaders: v.loaders,
                     date_published: v.date_published,
                     downloads: v.downloads,
                     url: primary.and_then(|f| f.url.clone()),
+                    filename: primary.map_or_else(String::new, |f| f.filename.clone()),
+                    size: primary.map_or(0, |f| f.size),
+                    sha1: primary.and_then(|f| f.hashes.get("sha1").cloned()),
+                    sha512: primary.and_then(|f| f.hashes.get("sha512").cloned()),
                 }
             })
             .collect())

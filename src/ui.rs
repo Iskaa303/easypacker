@@ -30,7 +30,7 @@ pub fn render_welcome(frame: &mut Frame, area: Rect, state: &WelcomeState, selec
         let err = state.error.as_deref().unwrap_or("");
         vec![
             Line::from(Span::styled(
-                " Enter path to modpack.json or project folder:",
+                " Enter path to Easypacker.toml or project folder:",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),

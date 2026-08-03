@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod cli;
 mod config;
+mod lock;
 mod project;
 mod search;
 mod tui;
@@ -17,12 +18,21 @@ async fn main() -> Result<()> {
 
     let args = cli::Cli::parse();
     let cfg = config::Config::load()?;
+    let cwd = std::env::current_dir()?;
+
+    // Every run: resolve the manifest and regenerate Easypacker.lock.
+    let manifest = project::Manifest::detect(&cwd);
+    if manifest.is_some() {
+        match lock::generate(&cwd, &cfg).await {
+            Ok(r) => eprintln!("Easypacker.lock: {} pinned, {} failed", r.resolved, r.failed),
+            Err(e) => eprintln!("easypacker: lockfile not updated: {e:#}"),
+        }
+    }
 
     if args.query.is_some() {
         api::run_cli(&args, &cfg).await?;
     } else {
-        let project = project::ModpackProject::detect(&std::env::current_dir()?);
-        tui::run_tui(cfg, project).await?;
+        tui::run_tui(cfg, manifest).await?;
     }
 
     Ok(())
