@@ -270,6 +270,50 @@ impl Manifest {
         })
     }
 
+    /// Return the spec for a mod identified by its platform slugs/ids.
+    pub fn spec_for(
+        &self,
+        project_type: &str,
+        modrinth_slug: Option<&str>,
+        curseforge_id: Option<i64>,
+    ) -> Option<&ModSpec> {
+        self.cat(project_type).iter().find_map(|(key, spec)| {
+            if let Some(s) = modrinth_slug
+                && spec.modrinth_slug(key) == s
+            {
+                return Some(spec);
+            }
+            if let Some(id) = curseforge_id
+                && spec.curseforge_project_id() == Some(id)
+            {
+                return Some(spec);
+            }
+            None
+        })
+    }
+
+    /// Return the manifest key for a mod identified by platform slugs/ids.
+    pub fn key_for(
+        &self,
+        project_type: &str,
+        modrinth_slug: Option<&str>,
+        curseforge_id: Option<i64>,
+    ) -> Option<String> {
+        self.cat(project_type).iter().find_map(|(key, spec)| {
+            if let Some(s) = modrinth_slug
+                && spec.modrinth_slug(key) == s
+            {
+                return Some(key.clone());
+            }
+            if let Some(id) = curseforge_id
+                && spec.curseforge_project_id() == Some(id)
+            {
+                return Some(key.clone());
+            }
+            None
+        })
+    }
+
     /// Render back to TOML. Detailed entries become single-line inline
     /// tables; simple string entries stay plain strings.
     pub fn render(&self) -> String {

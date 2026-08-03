@@ -31,5 +31,6 @@ pub(crate) struct App {
     pub form: Option<ui::FormState>,
     pub form_field_idx: Option<usize>,
     pub file_browse: Option<FileBrowseState>,
+    pub link_version: Option<LinkVersionState>,
     pub quit_requested: bool,
 }

@@ -48,6 +48,7 @@ pub struct ProjectFile {
     pub loaders: Vec<String>,
     pub date_published: String,
     pub downloads: u64,
+    pub size: u64,
     pub url: Option<String>,
     pub platforms: Vec<Platform>,
     pub modrinth_version_id: Option<String>,

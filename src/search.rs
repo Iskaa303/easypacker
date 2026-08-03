@@ -4,6 +4,7 @@ use crate::api::{
 };
 use crate::app::App;
 use crate::config::Config;
+use crate::project;
 use crate::types::*;
 use crossterm::event::KeyCode;
 use ratatui::Frame;
@@ -455,6 +456,7 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                             loaders: mv.loaders,
                             date_published: mv.date_published,
                             downloads: mv.downloads,
+                            size: mv.size,
                             url: mv.url.clone(),
                             platforms: vec![Platform::Modrinth],
                             modrinth_version_id: Some(mv.id),
@@ -515,6 +517,7 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                                 loaders,
                                 date_published: cf.file_date,
                                 downloads: cf.download_count,
+                                size: cf.file_length,
                                 url: cf.download_url.clone(),
                                 platforms: vec![Platform::CurseForge],
                                 modrinth_version_id: None,
@@ -1031,17 +1034,32 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
     let Some(ref fb) = app.file_browse else {
         return;
     };
+
+    // Determine which platforms the manifest spec actually links, so the
+    // added row can show accurate [M]/[C] badges even after a reopen.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let linked = project::Manifest::load(&cwd)
+        .ok()
+        .and_then(|m| {
+            m.spec_for(
+                &fb.project_type,
+                fb.modrinth_slug.as_deref(),
+                fb.curseforge_id.map(i64::from),
+            )
+            .map(|s| (s.has_modrinth(), s.has_curseforge()))
+        });
+    let (link_mr, link_cf) = linked.unwrap_or((false, false));
     let added = if fb.already_added || fb.added_index.is_some() {
         " [ALREADY IN MODPACK]"
     } else {
         ""
     };
-    let header = format!(
-        " {}{} — Esc:back  ↑↓:scroll  Enter:add  ({})",
-        fb.project_title,
-        added,
-        fb.files.len()
-    );
+    use ratatui::text::Span as TitleSpan;
+    let header = Line::from(vec![
+        TitleSpan::raw(format!(" {}{} — Esc:back  ↑↓:scroll  Enter:add/remove  ", fb.project_title, added)),
+        TitleSpan::styled("l:link other platform", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        TitleSpan::raw(format!("  ({})", fb.files.len())),
+    ]);
     let lines: Vec<Line> = fb
         .files
         .iter()
@@ -1068,6 +1086,21 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
             let loaders = f.loaders.join(", ");
             let date = &f.date_published[..f.date_published.len().min(10)];
             let dl = f.downloads;
+            // For the added row, show the manifest's linked platforms
+            // (mirrors the lockfile), not just this single file's origin.
+            let (mr_badge, cf_badge) = if is_added {
+                (link_mr, link_cf)
+            } else {
+                (
+                    f.platforms.contains(&Platform::Modrinth),
+                    f.platforms.contains(&Platform::CurseForge),
+                )
+            };
+            let badges = [
+                if mr_badge { " [M]" } else { "" },
+                if cf_badge { " [C]" } else { "" },
+            ]
+            .concat();
             Line::from(vec![
                 Span::styled(prefix, bg),
                 Span::styled(
@@ -1085,28 +1118,13 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
                 ),
                 Span::styled(format!("  {date}"), bg),
                 Span::styled(format!("  {dl}↓"), bg),
-                Span::styled(
-                    [
-                        if f.platforms.contains(&Platform::Modrinth) {
-                            " [M]"
-                        } else {
-                            ""
-                        },
-                        if f.platforms.contains(&Platform::CurseForge) {
-                            " [C]"
-                        } else {
-                            ""
-                        },
-                    ]
-                    .concat(),
-                    bg,
-                ),
+                Span::styled(badges, bg),
             ])
         })
         .collect();
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(header.as_str())
+        .title(header)
         .border_style(Style::default().fg(Color::Cyan));
     frame.render_widget(
         Paragraph::new(lines)
@@ -1114,4 +1132,341 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// Full-screen overlay for the link-version popup.
+pub(crate) fn render_link_version(frame: &mut Frame, app: &App) {
+    let (Some(ref fb), Some(ref lv)) = (app.file_browse.as_ref(), app.link_version.as_ref())
+    else {
+        return;
+    };
+    let area = frame.area();
+    // Centered popup: ~80% width, ~70% height, clamped to sane minimums.
+    let w = (area.width * 4 / 5).max(60);
+    let h = (area.height * 7 / 10).max(14);
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    let which = match lv.platform {
+        Platform::Modrinth => "Modrinth",
+        Platform::CurseForge => "CurseForge",
+    };
+    let added = fb
+        .added_index
+        .and_then(|i| fb.files.get(i))
+        .filter(|f| !f.platforms.contains(&lv.platform));
+    let title = match added {
+        Some(f) => format!(" Link {which} version for '{}' (Esc:back) ", f.name),
+        None => format!(" Link {which} version (Esc:back) "),
+    };
+
+    // Clear the popup area so file-browse rows don't bleed through.
+    frame.render_widget(ratatui::widgets::Clear, popup);
+
+    let border_style = Style::default().fg(Color::Yellow);
+    let block = Block::default().borders(Borders::ALL).title(title).border_style(border_style);
+    let inner = block.inner(popup);
+    frame.render_widget(&block, popup);
+
+    let constraints = vec![Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)];
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    // Query bar (always visible).
+    let prompt = if lv.picked.is_none() {
+        " Search project: "
+    } else {
+        " Title: "
+    };
+    let q = Paragraph::new(lv.query.as_str())
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(prompt)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+    frame.render_widget(q, chunks[0]);
+    let cx = chunks[0].x + 1 + lv.cursor as u16;
+    let cy = chunks[0].y + 1;
+    frame.set_cursor_position((cx.min(popup.right().saturating_sub(1)), cy));
+
+    // Body: query stage => results list; versions stage => file list.
+    let body = chunks[1];
+    if lv.picked.is_none() {
+        render_link_results(frame, body, lv);
+    } else {
+        render_link_files(frame, body, fb, lv);
+    }
+
+    // Hint footer.
+    let hint = if lv.picked.is_none() {
+        " Enter:search  ↑↓:select  Enter(on result):open versions  Esc:back "
+    } else {
+        " Enter:link version  ↑↓:select  Backspace:back to search  Esc:cancel (⚠ = size differs) "
+    };
+    let status = lv.status.as_deref().unwrap_or(hint);
+    let st_style = if lv.status.is_some() {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    frame.render_widget(Paragraph::new(Span::styled(status, st_style)), chunks[2]);
+}
+
+fn render_link_results(frame: &mut Frame, area: Rect, lv: &LinkVersionState) {
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " Results ({}) ",
+        lv.results.len()
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(&block, area);
+    let rows = (inner.height as usize) / 2;
+    let start = lv.scroll;
+    let items: Vec<Line> = lv
+        .results
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(i, r)| {
+            let is_sel = i == lv.selected;
+            let bg = if is_sel {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            let prefix = if is_sel { "▸ " } else { "  " };
+            let license = r.license.as_deref().unwrap_or("-");
+            let downloads = r.downloads;
+            Line::from(vec![
+                Span::styled(prefix, bg),
+                Span::styled(r.title.clone(), bg.add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled(r.project_type.clone(), bg.fg(Color::Cyan)),
+                Span::raw("  "),
+                Span::styled(format!("{license}"), bg.fg(Color::Gray)),
+                Span::raw("  "),
+                Span::styled(format!("{downloads}↓"), bg.fg(Color::Green)),
+            ])
+        })
+        .collect();
+    let p = Paragraph::new(items).wrap(Wrap { trim: false });
+    frame.render_widget(p, inner);
+}
+
+fn render_link_files(frame: &mut Frame, area: Rect, fb: &FileBrowseState, lv: &LinkVersionState) {
+    let block = Block::default().borders(Borders::ALL).title(" Matching versions ");
+    let inner = block.inner(area);
+    frame.render_widget(&block, area);
+    let added_file = fb.added_index.and_then(|i| fb.files.get(i));
+    let rows = inner.height as usize;
+    let start = lv.scroll;
+    let lines: Vec<Line> = lv
+        .files
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(i, f)| {
+            let is_sel = i == lv.selected;
+            let bg = if is_sel {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            let prefix = if is_sel { "▸ " } else { "  " };
+            let mc = f.mc_versions.first().map(|s| s.as_str()).unwrap_or("-");
+            let loaders = f.loaders.join(", ");
+            let date = &f.date_published[..f.date_published.len().min(10)];
+            let mut spans = vec![
+                Span::styled(prefix, bg),
+                Span::styled(f.name.clone(), bg.add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  MC:{mc}"), bg.fg(Color::Yellow)),
+            ];
+            if !loaders.is_empty() {
+                spans.push(Span::styled(format!("  {loaders}"), bg.fg(Color::Magenta)));
+            }
+            spans.push(Span::styled(format!("  {date}"), bg.fg(Color::DarkGray)));
+            spans.push(Span::styled(format!("  {}↓", f.downloads), bg.fg(Color::Green)));
+            if let Some(a) = added_file
+                && a.size != f.size
+            {
+                spans.push(Span::styled(format!("  ⚠ {}B", f.size), bg.fg(Color::Red)));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    let n = lines.len().max(1) as u16;
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
+        Rect::new(inner.x, inner.y, inner.width, n),
+    );
+}
+
+/// Kick off a real API search for the missing platform in the link popup.
+pub(crate) async fn start_link_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+    let (query, platform) = match app.link_version.as_ref() {
+        Some(lv) => (lv.query.trim().to_string(), lv.platform.clone()),
+        None => return,
+    };
+    if query.is_empty() {
+        return;
+    }
+    // Mark searching.
+    if let Some(ref mut lv) = app.link_version {
+        lv.status = Some(" ".into());
+        lv.results.clear();
+        lv.scroll = 0;
+        lv.selected = 0;
+    }
+    let pt = app
+        .file_browse
+        .as_ref()
+        .map(|fb| fb.project_type.clone())
+        .unwrap_or_else(|| "mod".to_string());
+    let api_key = cfg.get_api_key(None).ok();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let filters = SearchFilters {
+            query,
+            version: None,
+            loader: None,
+            project_type: Some(pt),
+            sort: "relevance".into(),
+            limit: 25,
+            offset: 0,
+        };
+        let results = match platform {
+            Platform::Modrinth => ModrinthClient::search(&filters).await,
+            Platform::CurseForge => match &api_key {
+                Some(key) => CurseForgeClient::new(key).search(&filters).await,
+                None => Ok(Vec::new()),
+            },
+        };
+        match results {
+            Ok(results) => {
+                let _ = tx.send(AppEvent::LinkResults { results }).await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::Error(format!("Link search: {e}"))).await;
+            }
+        }
+    });
+}
+
+/// Fetch versions for a project picked in the link popup.
+pub(crate) async fn start_link_file_fetch(
+    app: &mut App,
+    cfg: &Config,
+    tx: &tokio::sync::mpsc::Sender<AppEvent>,
+) {
+    let platform = app.link_version.as_ref().map(|lv| lv.platform.clone()).unwrap();
+    let Some(picked) = app.link_version.as_ref().and_then(|lv| lv.picked.clone()) else {
+        return;
+    };
+    let modrinth_slug = picked.modrinth_slug.clone();
+    let curseforge_id = picked.curseforge_id;
+    let api_key = cfg.get_api_key(None).ok();
+    // Mirror normal file-fetch filters: project MC version + loader (mods only).
+    let version_filter = app
+        .project
+        .as_ref()
+        .map(|p| p.project.minecraft.clone())
+        .unwrap_or_default();
+    let project_type = app
+        .file_browse
+        .as_ref()
+        .map(|fb| fb.project_type.clone())
+        .unwrap_or_else(|| "mod".to_string());
+    let loader_filter = if project_type == "mod" {
+        app.project.as_ref().map(|p| p.project.loader.clone()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if let Some(ref mut lv) = app.link_version {
+        lv.status = Some(" ".into());
+        lv.files.clear();
+        lv.scroll = 0;
+        lv.selected = 0;
+    }
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let mut files: Vec<ProjectFile> = Vec::new();
+        if platform == Platform::Modrinth
+            && let Some(slug) = modrinth_slug.as_deref()
+        {
+            if let Ok(versions) = ModrinthClient::get_versions(slug, None, None).await {
+                for mv in versions {
+                    files.push(ProjectFile {
+                        name: mv.name,
+                        mc_versions: mv.game_versions,
+                        loaders: mv.loaders,
+                        date_published: mv.date_published,
+                        downloads: mv.downloads,
+                        size: mv.size,
+                        url: mv.url.clone(),
+                        platforms: vec![Platform::Modrinth],
+                        modrinth_version_id: Some(mv.id),
+                        modrinth_url: mv.url,
+                        curseforge_file_id: None,
+                        curseforge_url: None,
+                    });
+                }
+            }
+        }
+        if platform == Platform::CurseForge
+            && let Some(id) = curseforge_id
+            && let Some(key) = api_key.as_deref()
+        {
+            let client = CurseForgeClient::new(key);
+            if let Ok(cfs) = client.get_files(id, None, None).await {
+                let known: Vec<&str> = filters::LOADERS.to_vec();
+                for cf in cfs {
+                    let loaders: Vec<String> = cf
+                        .game_versions
+                        .iter()
+                        .filter(|v| known.iter().any(|l| v.eq_ignore_ascii_case(l)))
+                        .map(|v| v.to_lowercase())
+                        .collect();
+                    let mc_versions: Vec<String> = cf
+                        .game_versions
+                        .into_iter()
+                        .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
+                        .collect();
+                    files.push(ProjectFile {
+                        name: cf.display_name,
+                        mc_versions,
+                        loaders,
+                        date_published: cf.file_date,
+                        downloads: cf.download_count,
+                        size: cf.file_length,
+                        url: cf.download_url.clone(),
+                        platforms: vec![Platform::CurseForge],
+                        modrinth_version_id: None,
+                        modrinth_url: None,
+                        curseforge_file_id: Some(cf.id),
+                        curseforge_url: cf.download_url,
+                    });
+                }
+            }
+        }
+        // Apply the same version/loader filters as the normal file browse.
+        let filtered: Vec<ProjectFile> = files
+            .into_iter()
+            .filter(|f| {
+                let mc_ok = version_filter.is_empty()
+                    || f.mc_versions.iter().any(|v| v == &version_filter);
+                let loader_ok = loader_filter.is_empty()
+                    || f.loaders.iter().any(|l| l == &loader_filter);
+                mc_ok && loader_ok
+            })
+            .collect();
+        let _ = tx.send(AppEvent::LinkFiles { files: filtered }).await;
+    });
 }

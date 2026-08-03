@@ -1,4 +1,4 @@
-use crate::api::types::{ProjectFile, SearchResult};
+use crate::api::types::{Platform, ProjectFile, SearchResult};
 use std::collections::HashSet;
 
 #[derive(PartialEq)]
@@ -54,6 +54,29 @@ pub(crate) enum BrowseAction {
     None,
 }
 
+/// Overlay popup for linking the same version on the other platform.
+/// `picked.is_none()` => Query stage (search results).
+/// `picked.is_some()` => Versions stage (the picked project's files).
+pub(crate) struct LinkVersionState {
+    pub platform: Platform,
+    pub query: String,
+    pub cursor: usize,
+    pub selected: usize,
+    pub scroll: usize,
+    pub results: Vec<SearchResult>,
+    pub files: Vec<ProjectFile>,
+    pub picked: Option<PickedProject>,
+    pub status: Option<String>,
+    pub searched_query: Option<String>,
+}
+
+/// Project chosen in the link popup, to fetch versions for.
+#[derive(Clone)]
+pub(crate) struct PickedProject {
+    pub modrinth_slug: Option<String>,
+    pub curseforge_id: Option<i32>,
+}
+
 pub(crate) struct FiltersState {
     pub version: String,
     pub loader: String,
@@ -100,6 +123,12 @@ pub(crate) enum AppEvent {
         saved: HashSet<String>,
     },
     IconLoaded(usize, Vec<u8>),
+    LinkResults {
+        results: Vec<SearchResult>,
+    },
+    LinkFiles {
+        files: Vec<ProjectFile>,
+    },
 }
 #[derive(Clone, PartialEq)]
 pub(crate) enum AppMode {

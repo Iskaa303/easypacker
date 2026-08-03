@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::api::types::{Platform, ProjectFile};
 use crate::config::Config;
 use crate::lock;
 use crate::project;
@@ -53,6 +54,7 @@ pub async fn run_tui(_cfg: Config, project: Option<project::Manifest>) -> Result
         form: None,
         form_field_idx: None,
         file_browse: None,
+        link_version: None,
         quit_requested: false,
     };
 
@@ -90,7 +92,16 @@ async fn run(
                     AppMode::Settings | AppMode::CreateProject => {
                         handle_form_mode(app, key.code, tx).await
                     }
-                    AppMode::FileBrowse => match key.code {
+                    AppMode::FileBrowse => {
+                        // Link-version overlay popup takes all keys.
+                        if app.link_version.is_some() {
+                            handle_link_version(app, key.code, &Config::load().unwrap_or_default(), tx).await;
+                            if app.quit_requested {
+                                break Ok(());
+                            }
+                            continue;
+                        }
+                        match key.code {
                         KeyCode::Up => {
                             if let Some(ref mut fb) = app.file_browse {
                                 if fb.selected > 0 {
@@ -191,8 +202,11 @@ async fn run(
                                 }
                             }
                         }
+                        KeyCode::Char('l') => {
+                            open_link_version_popup(app);
+                        }
                         _ => {}
-                    },
+                    }}
                 }
                 if app.quit_requested {
                     break Ok(());
@@ -320,6 +334,29 @@ async fn run(
                         }
                     }
                 }
+                AppEvent::LinkResults { results } => {
+                    if let Some(ref mut lv) = app.link_version {
+                        lv.results = results;
+                        lv.searched_query = Some(lv.query.trim().to_string());
+                        lv.scroll = 0;
+                        lv.selected = 0;
+                        lv.status = None;
+                    }
+                }
+                AppEvent::LinkFiles { files } => {
+                    if let Some(ref mut lv) = app.link_version {
+                        lv.files.clear();
+                        // Keep only the missing platform's files.
+                        for f in files {
+                            if f.platforms.contains(&lv.platform) {
+                                lv.files.push(f);
+                            }
+                        }
+                        lv.scroll = 0;
+                        lv.selected = 0;
+                        lv.status = None;
+                    }
+                }
             }
         }
     }
@@ -340,7 +377,12 @@ fn render(frame: &mut Frame, app: &App) {
                 .unwrap_or("(no project)");
             ui::render_main_menu(frame, frame.area(), name, app.menu_selection);
         }
-        AppMode::FileBrowse => search::render_file_browse(frame, app),
+        AppMode::FileBrowse => {
+            search::render_file_browse(frame, app);
+            if app.link_version.is_some() {
+                search::render_link_version(frame, app);
+            }
+        }
         AppMode::Search => search::render_search_screen(frame, app),
         AppMode::Settings | AppMode::CreateProject => {
             if let Some(ref browse) = app.browse_mode {
@@ -420,6 +462,298 @@ fn render_browse_simple(frame: &mut Frame, area: ratatui::layout::Rect, browse: 
 }
 
 // ── Mode handlers ──────────────────────────────────────────
+
+/// Open the link-version popup for the currently-browsed project.
+/// Decides which platform is missing by reading the manifest spec (the
+/// added file's platforms may be unknown on a reopen), and only opens if
+/// the other platform's slug/id is actually known.
+fn open_link_version_popup(app: &mut App) {
+    let Some(ref fb) = app.file_browse else {
+        return;
+    };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let spec = project::Manifest::load(&cwd)
+        .ok()
+        .and_then(|m|
+            m.spec_for(
+                &fb.project_type,
+                fb.modrinth_slug.as_deref(),
+                fb.curseforge_id.map(i64::from),
+            )
+            .map(|s| s.clone()));
+    let spec = match spec {
+        Some(s) => s,
+        None => return,
+    };
+    let has_mr = spec.has_modrinth();
+    let has_cf = spec.has_curseforge();
+    // Target the missing platform; if both are already linked, let the user
+    // change whichever platform the currently-selected file is on.
+    let platform = match (!has_mr, !has_cf) {
+        (true, false) => Platform::Modrinth,
+        (false, true) => Platform::CurseForge,
+        (false, false) => {
+            // Both linked — change the selected file's own platform.
+            fb.files
+                .get(fb.selected)
+                .and_then(|f| f.platforms.first().cloned())
+                .unwrap_or(Platform::CurseForge)
+        }
+        (true, true) => return, // spec neither — nothing to relink from
+    };
+
+    let query = fb.project_title.clone();
+    let cursor = query.chars().count();
+    app.link_version = Some(LinkVersionState {
+        platform,
+        query,
+        cursor,
+        scroll: 0,
+        selected: 0,
+        results: Vec::new(),
+        files: Vec::new(),
+        picked: None,
+        status: None,
+        searched_query: None,
+    });
+}
+
+async fn handle_link_version(
+    app: &mut App,
+    key: KeyCode,
+    cfg: &Config,
+    tx: &tokio::sync::mpsc::Sender<AppEvent>,
+) {
+    if app.link_version.is_none() {
+        return;
+    }
+    let in_versions = app.link_version.as_ref().map(|lv| lv.picked.is_some()).unwrap();
+    match key {
+        KeyCode::Esc => app.link_version = None,
+        KeyCode::Backspace if in_versions => {
+            // Back to query stage.
+            if let Some(ref mut lv) = app.link_version {
+                lv.picked = None;
+                lv.files.clear();
+                lv.scroll = 0;
+                lv.selected = 0;
+                lv.status = None;
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(ref mut lv) = app.link_version {
+                if lv.cursor > 0 {
+                    // Remove last char (byte-safe for utf-8).
+                    let before = &lv.query[..lv.cursor];
+                    if let Some(ch) = before.chars().next_back() {
+                        let new_cursor = lv.cursor - ch.len_utf8();
+                        lv.query.replace_range(new_cursor..lv.cursor, "");
+                        lv.cursor = new_cursor;
+                    }
+                }
+                lv.selected = 0;
+                lv.scroll = 0;
+            }
+        }
+        KeyCode::Left if !in_versions => {
+            if let Some(ref mut lv) = app.link_version {
+                lv.cursor = lv.cursor.saturating_sub(1);
+            }
+        }
+        KeyCode::Right if !in_versions => {
+            if let Some(ref mut lv) = app.link_version {
+                let qlen = lv.query.len();
+                lv.cursor = lv.cursor.min(qlen);
+                if lv.cursor < qlen {
+                    lv.cursor += lv.query[lv.cursor..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+                }
+            }
+        }
+        KeyCode::Char(c) if !in_versions => {
+            if let Some(ref mut lv) = app.link_version {
+                lv.query.insert(lv.cursor, c);
+                lv.cursor += c.len_utf8();
+                lv.selected = 0;
+                lv.scroll = 0;
+            }
+        }
+        KeyCode::Up => {
+            if let Some(ref mut lv) = app.link_version {
+                if lv.selected > 0 {
+                    lv.selected -= 1;
+                }
+                if lv.selected < lv.scroll {
+                    lv.scroll = lv.selected;
+                }
+            }
+        }
+        KeyCode::Down => {
+            if let Some(ref mut lv) = app.link_version {
+                let max = if in_versions {
+                    lv.files.len()
+                } else {
+                    lv.results.len()
+                };
+                let max = max.saturating_sub(1);
+                if lv.selected < max {
+                    lv.selected += 1;
+                }
+                let vis: usize = 10;
+                if lv.selected >= lv.scroll + vis.saturating_sub(1) {
+                    lv.scroll += 1;
+                }
+            }
+        }
+        KeyCode::Enter if !in_versions => {
+            // Re-search if the query changed since the last search, or there are no results.
+            let need_search = app.link_version.as_ref().map(|lv| {
+                let q = lv.query.trim().to_string();
+                q.is_empty() || lv.searched_query.as_deref() != Some(q.as_str()) || lv.results.is_empty()
+            }).unwrap_or(false);
+            if need_search {
+                search::start_link_search(app, cfg, tx).await;
+                return;
+            }
+            if let Some(ref mut lv) = app.link_version {
+                if lv.selected >= lv.results.len() {
+                    return;
+                }
+                let r = &lv.results[lv.selected];
+                let picked = PickedProject {
+                    modrinth_slug: r.cross.modrinth_slug.clone(),
+                    curseforge_id: r.cross.curseforge_id,
+                };
+                lv.picked = Some(picked);
+            }
+            search::start_link_file_fetch(app, cfg, tx).await;
+        }
+        KeyCode::Enter if in_versions => {
+            let (platform, chosen, picked) = {
+                let lv = app.link_version.as_ref().unwrap();
+                (
+                    lv.platform.clone(),
+                    if lv.selected < lv.files.len() {
+                        Some(lv.files[lv.selected].clone())
+                    } else {
+                        None
+                    },
+                    lv.picked.clone(),
+                )
+            };
+            app.link_version = None;
+            apply_link_version(app, platform, chosen, picked);
+        }
+        _ => {}
+    }
+}
+
+/// Merge the chosen other-platform file into the added version's manifest
+/// entry, then rebuild the lockfile. Warns (to stderr) if file sizes differ.
+fn apply_link_version(
+    app: &mut App,
+    platform: Platform,
+    chosen: Option<ProjectFile>,
+    picked: Option<PickedProject>,
+) {
+    let Some(chosen) = chosen else {
+        return;
+    };
+    let Some(ref mut fb) = app.file_browse else {
+        return;
+    };
+    let Some(added_idx) = fb.added_index else {
+        return;
+    };
+    let Some(added_file) = fb.files.get_mut(added_idx) else {
+        return;
+    };
+
+    // The slug/id learned from the link search, falling back to the browse meta.
+    let picked_slug = picked
+        .as_ref()
+        .and_then(|p| p.modrinth_slug.clone())
+        .or_else(|| fb.modrinth_slug.clone());
+    let picked_id = picked
+        .as_ref()
+        .and_then(|p| p.curseforge_id)
+        .or_else(|| fb.curseforge_id);
+
+    if added_file.size != chosen.size {
+        eprintln!(
+            "easypacker: size mismatch linking {plat:?}: {} vs {} bytes — not the same file",
+            added_file.size, chosen.size, plat = platform
+        );
+    }
+
+    match platform {
+        Platform::Modrinth => {
+            added_file.modrinth_version_id = chosen.modrinth_version_id.clone();
+            added_file.modrinth_url = chosen.modrinth_url.clone();
+            // Also pick up the modrinth slug if the browse didn't have it.
+            if !added_file.platforms.contains(&Platform::Modrinth) {
+                added_file.platforms.push(Platform::Modrinth);
+            }
+        }
+        Platform::CurseForge => {
+            added_file.curseforge_file_id = chosen.curseforge_file_id;
+            added_file.curseforge_url = chosen.curseforge_url.clone();
+            if !added_file.platforms.contains(&Platform::CurseForge) {
+                added_file.platforms.push(Platform::CurseForge);
+            }
+        }
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if let Ok(mut manifest) = project::Manifest::load(&cwd) {
+        let cat = fb.project_type.clone();
+        // Find the EXISTING entry's key by any platform identifier we know
+        // (the original plus the one just picked), so we update in place
+        // rather than creating a duplicate.
+        let mut existing_key: Option<String> = None;
+        for (ms, cid) in [
+            (fb.modrinth_slug.as_deref(), fb.curseforge_id.map(i64::from)),
+            (picked_slug.as_deref(), picked_id.map(i64::from)),
+        ] {
+            if existing_key.is_none() {
+                existing_key = manifest.key_for(&cat, ms, cid);
+            }
+        }
+        let key = existing_key
+            .or(picked_slug.clone())
+            .unwrap_or_else(|| project::slugify(&fb.project_title));
+        // The chosen file's display name pins the exact file on resolve.
+        let chosen_name = chosen.name.clone();
+        if let Some(spec) = manifest.cat_mut(&cat).get_mut(&key)
+            && let project::ModSpec::Detailed(d) = spec
+        {
+            match platform {
+                Platform::Modrinth if picked_slug.is_some() => {
+                    d.modrinth = Some(project::ModrinthSpec {
+                        slug: picked_slug.clone(),
+                        version: Some(chosen_name.clone()),
+                    });
+                }
+                Platform::CurseForge if picked_id.is_some() => {
+                    d.curseforge = Some(project::CurseForgeSpec {
+                        project_id: picked_id.map(i64::from),
+                        version: Some(chosen_name.clone()),
+                    });
+                }
+                _ => {}
+            }
+        }
+        if manifest.save(&cwd).is_ok() {
+            app.project = Some(manifest);
+            let cwd2 = cwd.clone();
+            tokio::spawn(async move {
+                let cfg = Config::load().unwrap_or_default();
+                if let Err(e) = lock::generate(&cwd2, &cfg).await {
+                    eprintln!("lock: {e}");
+                }
+            });
+        }
+    }
+}
 
 fn handle_welcome(app: &mut App, key: KeyCode) {
     let action = ui::handle_welcome_key(&mut app.welcome_state, key, &mut app.menu_selection);
