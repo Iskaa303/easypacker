@@ -123,18 +123,34 @@ async fn run(
                                     let f = &fb.files[fb.selected];
                                     let cwd = std::env::current_dir().unwrap_or_default();
                                     if let Ok(mut manifest) = project::Manifest::load(&cwd) {
-                                        if !manifest.contains(
-                                            &fb.project_type,
-                                            fb.modrinth_slug.as_deref(),
-                                            fb.curseforge_id.map(i64::from),
-                                        ) {
+                                        let key = fb
+                                            .modrinth_slug
+                                            .clone()
+                                            .unwrap_or_else(|| {
+                                                project::slugify(&fb.project_title)
+                                            });
+                                        // Remove if pressing Enter on the already-added version.
+                                        if fb.added_index == Some(fb.selected) {
+                                            manifest.cat_mut(&fb.project_type).remove(&key);
+                                            if manifest.save(&cwd).is_ok() {
+                                                app.project = Some(manifest);
+                                                fb.already_added = false;
+                                                fb.added_index = None;
+                                                let cwd2 = cwd.clone();
+                                                tokio::spawn(async move {
+                                                    let cfg = Config::load().unwrap_or_default();
+                                                    if let Err(e) = lock::generate(&cwd2, &cfg).await {
+                                                        eprintln!("lock: {e}");
+                                                    }
+                                                });
+                                            }
+                                        } else {
+                                            // Add or change version.
                                             let has_mr = f.modrinth_version_id.is_some()
                                                 && fb.modrinth_slug.is_some();
                                             let has_cf = f.curseforge_file_id.is_some()
                                                 && fb.curseforge_id.is_some();
                                             let both = has_mr && has_cf;
-                                            // Same file on both platforms => shared
-                                            // `version`, inherited per platform.
                                             let spec =
                                                 project::ModSpec::Detailed(project::DetailedSpec {
                                                     version: both.then(|| f.name.clone()),
@@ -155,17 +171,13 @@ async fn run(
                                                         }
                                                     }),
                                                 });
-                                            let key = fb
-                                                .modrinth_slug
-                                                .clone()
-                                                .unwrap_or_else(|| {
-                                                    project::slugify(&fb.project_title)
-                                                });
                                             manifest
                                                 .cat_mut(&fb.project_type)
                                                 .insert(key, spec);
                                             if manifest.save(&cwd).is_ok() {
                                                 app.project = Some(manifest);
+                                                fb.already_added = true;
+                                                fb.added_index = Some(fb.selected);
                                                 let cwd2 = cwd.clone();
                                                 tokio::spawn(async move {
                                                     let cfg = Config::load().unwrap_or_default();
@@ -174,8 +186,6 @@ async fn run(
                                                     }
                                                 });
                                             }
-                                            fb.already_added = true;
-                                            fb.added_index = Some(fb.selected);
                                         }
                                     }
                                 }
