@@ -356,4 +356,5 @@ pub fn slugify(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "../tests/project_tests.rs"]
 mod tests;
