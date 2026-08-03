@@ -46,6 +46,7 @@ pub(crate) struct FileBrowseState {
     pub scroll: usize,
     pub selected: usize,
     pub already_added: bool,
+    pub added_index: Option<usize>,
 }
 pub(crate) enum BrowseAction {
     Toggle(FilterKind),

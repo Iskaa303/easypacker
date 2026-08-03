@@ -1,5 +1,6 @@
 use crate::app::App;
 use crate::config::Config;
+use crate::lock;
 use crate::project;
 use crate::search;
 use crate::types::*;
@@ -165,8 +166,16 @@ async fn run(
                                                 .insert(key, spec);
                                             if manifest.save(&cwd).is_ok() {
                                                 app.project = Some(manifest);
+                                                let cwd2 = cwd.clone();
+                                                tokio::spawn(async move {
+                                                    let cfg = Config::load().unwrap_or_default();
+                                                    if let Err(e) = lock::generate(&cwd2, &cfg).await {
+                                                        eprintln!("lock: {e}");
+                                                    }
+                                                });
                                             }
                                             fb.already_added = true;
+                                            fb.added_index = Some(fb.selected);
                                         }
                                     }
                                 }
@@ -229,7 +238,9 @@ async fn run(
                     project_type,
                 } => {
                     let cwd = std::env::current_dir().unwrap_or_default();
-                    let already = project::Manifest::load(&cwd)
+                    let manifest = project::Manifest::load(&cwd).ok();
+                    let already = manifest
+                        .as_ref()
                         .map(|m| {
                             m.contains(
                                 &project_type,
@@ -238,6 +249,18 @@ async fn run(
                             )
                         })
                         .unwrap_or(false);
+                    let added_index = if already {
+                        manifest.and_then(|m| {
+                            let ver = m.version_of(
+                                &project_type,
+                                modrinth_slug.as_deref(),
+                                curseforge_id.map(i64::from),
+                            )?;
+                            files.iter().position(|f| f.name == ver)
+                        })
+                    } else {
+                        None
+                    };
                     app.file_browse = Some(FileBrowseState {
                         project_title,
                         modrinth_slug,
@@ -247,6 +270,7 @@ async fn run(
                         scroll: 0,
                         selected: 0,
                         already_added: already,
+                        added_index,
                     });
                     app.mode = AppMode::FileBrowse;
                 }

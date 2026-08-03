@@ -884,12 +884,22 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
 
         let text_x = inner.x + 8;
         let text_w = inner.width.saturating_sub(9);
+        let in_pack = app.project.as_ref().map_or(false, |m| {
+            m.contains(
+                &r.project_type,
+                r.cross.modrinth_slug.as_deref(),
+                r.cross.curseforge_id.map(i64::from),
+            )
+        });
+
         let sel_style = if selected {
             Style::default().bg(Color::Blue).fg(Color::White)
+        } else if in_pack {
+            Style::default().bg(Color::Green).fg(Color::Black)
         } else {
             Style::default()
         };
-        let prefix = if selected { "▸ " } else { "  " };
+        let prefix = if selected { "▸ " } else if in_pack { "✓ " } else { "  " };
         let license = r.license.as_deref().unwrap_or("-");
         let latest = r.latest_version.as_deref().unwrap_or("-");
         let loaders_str = if r.loaders.is_empty() {
@@ -928,18 +938,24 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         }
         let stats_str = stats_parts.join("  ");
 
-        let title_line = Line::from(vec![
-            Span::styled(
-                format!("{}{}{}", prefix, r.title, badges),
-                sel_style.add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(format!("[{}]", icon_char), Style::default().fg(icon_color)),
-            Span::raw("  "),
-            Span::styled(license, Style::default().fg(Color::Cyan)),
-            Span::raw("  "),
-            Span::styled(stats_str, Style::default().fg(Color::Green)),
-        ]);
+        let mut title_spans: Vec<Span> = Vec::new();
+        title_spans.push(Span::styled(
+            format!("{prefix}{}", r.title),
+            sel_style.add_modifier(Modifier::BOLD),
+        ));
+        if !badges.is_empty() {
+            title_spans.push(Span::styled(
+                badges,
+                sel_style,
+            ));
+        }
+        title_spans.push(Span::raw("  "));
+        title_spans.push(Span::styled(format!("[{}]", icon_char), Style::default().fg(icon_color)));
+        title_spans.push(Span::raw("  "));
+        title_spans.push(Span::styled(license, Style::default().fg(Color::Cyan)));
+        title_spans.push(Span::raw("  "));
+        title_spans.push(Span::styled(stats_str, Style::default().fg(Color::Green)));
+        let title_line = Line::from(title_spans);
         let meta_line = Line::from(vec![
             Span::styled(
                 format!("  {}  ", r.author),
@@ -1015,7 +1031,7 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
     let Some(ref fb) = app.file_browse else {
         return;
     };
-    let added = if fb.already_added {
+    let added = if fb.already_added || fb.added_index.is_some() {
         " [ALREADY IN MODPACK]"
     } else {
         ""
@@ -1034,33 +1050,41 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
         .take(area.height.saturating_sub(2) as usize)
         .map(|(i, f)| {
             let is_sel = i == fb.selected;
-            let prefix = if is_sel { "▸ " } else { "  " };
-            let bg = if is_sel {
-                Style::default().bg(Color::Blue)
+            let is_added = fb.added_index.is_some_and(|idx| idx == i);
+            let (prefix, bg) = if is_added {
+                (
+                    "✓ ",
+                    Style::default().bg(Color::Green).fg(Color::Black),
+                )
+            } else if is_sel {
+                (
+                    "▸ ",
+                    Style::default().bg(Color::Blue).fg(Color::White),
+                )
             } else {
-                Style::default()
+                ("  ", Style::default())
             };
             let mc = f.mc_versions.first().map(|s| s.as_str()).unwrap_or("-");
             let loaders = f.loaders.join(", ");
             let date = &f.date_published[..f.date_published.len().min(10)];
             let dl = f.downloads;
             Line::from(vec![
-                Span::styled(prefix, bg.fg(Color::Yellow)),
+                Span::styled(prefix, bg),
                 Span::styled(
                     f.name.clone(),
-                    bg.fg(Color::White).add_modifier(Modifier::BOLD),
+                    bg.add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  MC:{mc}"), bg.fg(Color::Yellow)),
+                Span::styled(format!("  MC:{mc}"), bg),
                 Span::styled(
                     if loaders.is_empty() {
                         String::new()
                     } else {
                         format!("  {loaders}")
                     },
-                    bg.fg(Color::Magenta),
+                    bg,
                 ),
-                Span::styled(format!("  {date}"), bg.fg(Color::DarkGray)),
-                Span::styled(format!("  {dl}↓"), bg.fg(Color::Green)),
+                Span::styled(format!("  {date}"), bg),
+                Span::styled(format!("  {dl}↓"), bg),
                 Span::styled(
                     [
                         if f.platforms.contains(&Platform::Modrinth) {
@@ -1075,7 +1099,7 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
                         },
                     ]
                     .concat(),
-                    bg.fg(Color::Cyan),
+                    bg,
                 ),
             ])
         })

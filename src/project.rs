@@ -152,6 +152,22 @@ impl ModSpec {
             Self::Detailed(d) => d.curseforge.as_ref().and_then(|c| c.project_id),
         }
     }
+
+    /// A `Simple` spec targets all platforms.
+    /// A `Detailed` spec targets only platforms it explicitly names.
+    pub fn has_modrinth(&self) -> bool {
+        match self {
+            Self::Simple(_) => true,
+            Self::Detailed(d) => d.modrinth.is_some(),
+        }
+    }
+
+    pub fn has_curseforge(&self) -> bool {
+        match self {
+            Self::Simple(_) => true,
+            Self::Detailed(d) => d.curseforge.is_some(),
+        }
+    }
 }
 
 pub const CATEGORIES: [(&str, i32); 4] = [
@@ -229,6 +245,28 @@ impl Manifest {
                 return true;
             }
             false
+        })
+    }
+
+    /// Return the version string for a mod identified by its platform slugs/ids.
+    pub fn version_of(
+        &self,
+        project_type: &str,
+        modrinth_slug: Option<&str>,
+        curseforge_id: Option<i64>,
+    ) -> Option<String> {
+        self.cat(project_type).iter().find_map(|(key, spec)| {
+            if let Some(s) = modrinth_slug
+                && spec.modrinth_slug(key) == s
+            {
+                return spec.version_for(true);
+            }
+            if let Some(id) = curseforge_id
+                && spec.curseforge_project_id() == Some(id)
+            {
+                return spec.version_for(false);
+            }
+            None
         })
     }
 

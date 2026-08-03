@@ -197,6 +197,12 @@ async fn resolve_entry(
     let mut mr_lock = None;
     let mut cf_lock = None;
 
+    // Only query platforms the spec actually targets.
+    let has_mr = spec.has_modrinth();
+    let has_cf = spec.has_curseforge();
+    let want_mr = want_mr && has_mr;
+    let want_cf = want_cf && has_cf;
+
     if want_mr {
         match resolve_modrinth(id, spec, mc, loader, is_mod).await {
             Ok((title, vname, l)) => {
