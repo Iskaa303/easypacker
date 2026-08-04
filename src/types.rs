@@ -82,6 +82,10 @@ pub(crate) struct PickedProject {
 pub(crate) struct DepRow {
     /// easypacker id = manifest key = modrinth slug (or cf slug/name).
     pub id: String,
+    /// Raw platform project id (modrinth project id / cf modId) for API calls.
+    pub project_id: String,
+    /// Platform the parent declared this dep on.
+    pub platform: Platform,
     pub title: String,
     /// true if the parent declared it optional. Optional deps start disabled;
     /// the player toggles them on. Required deps start enabled.

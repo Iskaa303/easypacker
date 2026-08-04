@@ -54,6 +54,8 @@ struct LockCurseForge {
     hashes: Option<LockHashes>,
     /// ids this file depends on.
     dependencies: Vec<LockDep>,
+    /// curseforge slug, used to cross-lookup the modrinth counterpart.
+    slug: String,
 }
 
 struct LockHashes {
@@ -117,6 +119,44 @@ pub fn read_known_ids(dir: &Path) -> (std::collections::HashSet<String>, std::co
         }
     }
     (slugs, cf_ids)
+}
+
+/// Find the version string of a project in the existing lockfile, matched by
+/// modrinth slug or curseforge project id. Used to mark the added file in
+/// file-browse for lockfile-only deps.
+pub fn read_lock_version(
+    dir: &Path,
+    modrinth_slug: Option<&str>,
+    curseforge_id: Option<i64>,
+) -> Option<String> {
+    let raw = std::fs::read_to_string(dir.join(LOCK_FILE)).ok()?;
+    let toml: toml::Value = toml::from_str(&raw).ok()?;
+    for key in ["mod", "resourcepack", "datapack", "shader"] {
+        let arr = toml.get(key)?.as_array()?;
+        for entry in arr {
+            let slug_match = modrinth_slug.is_some_and(|s| {
+                entry
+                    .get("modrinth")
+                    .and_then(|v| v.get("slug"))
+                    .and_then(|v| v.as_str())
+                    == Some(s)
+            });
+            let cf_match = curseforge_id.is_some_and(|id| {
+                entry
+                    .get("curseforge")
+                    .and_then(|v| v.get("project_id"))
+                    .and_then(|v| v.as_integer())
+                    == Some(id)
+            });
+            if slug_match || cf_match {
+                return entry
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+            }
+        }
+    }
+    None
 }
 
 /// Resolve every manifest entry and rewrite Easypacker.lock. The lockfile is
@@ -306,6 +346,107 @@ async fn resolve_entry(
         }
     }
 
+    // Cross-platform: a spec that only declares one platform (e.g. a dep
+    // written by the dependency popup) still tries to attach the counterpart
+    // platform's file, like any normal mod resolved through the file browse.
+    if want_mr
+        && mr_lock.is_none()
+        && let Some(ref l) = cf_lock
+    {
+        match ModrinthClient::get_project(&l.slug).await {
+            Ok(project) => {
+                match ModrinthClient::get_versions(
+                    &l.slug,
+                    if mc.is_empty() { None } else { Some(mc) },
+                    if is_mod && !loader.is_empty() { Some(loader) } else { None },
+                )
+                .await
+                {
+                    Ok(versions) => {
+                        if let Some(v) = versions.first() {
+                            mr_lock = Some(LockModrinth {
+                                slug: project.slug.clone(),
+                                project_id: project.id,
+                                version_id: v.id.clone(),
+                                filename: v.filename.clone(),
+                                url: v.url.clone(),
+                                size: v.size,
+                                hashes: LockHashes::new(v.sha1.clone(), v.sha512.clone(), None),
+                                dependencies: v
+                                    .dependencies
+                                    .iter()
+                                    .filter(|d| {
+                                        d.kind == DepKind::Required || d.kind == DepKind::Optional
+                                    })
+                                    .map(|d| LockDep {
+                                        id: d.project_id.clone(),
+                                        optional: d.kind == DepKind::Optional,
+                                    })
+                                    .collect(),
+                            });
+                            if name.is_none() {
+                                name = Some(project.title);
+                            }
+                            if version_name.is_none() {
+                                version_name = Some(v.name.clone());
+                            }
+                        }
+                    }
+                    Err(e) => warnings.push(format!("modrinth cross: {e}")),
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    if want_cf
+        && cf_lock.is_none()
+        && let Some(ref l) = mr_lock
+        && let Some(ref client) = cf
+    {
+        match client
+            .find_by_slug(&l.slug, Some(class_id))
+            .await
+        {
+            Ok(Some((mod_id, _))) => {
+                match client
+                    .get_files(
+                        mod_id,
+                        if mc.is_empty() { None } else { Some(mc) },
+                        if is_mod && !loader.is_empty() { Some(loader) } else { None },
+                    )
+                    .await
+                {
+                    Ok(files) => {
+                        if let Some(f) = files.first() {
+                            cf_lock = Some(LockCurseForge {
+                                project_id: i64::from(mod_id),
+                                file_id: i64::from(f.id),
+                                filename: f.file_name.clone(),
+                                url: f.download_url.clone(),
+                                size: f.file_length,
+                                hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
+                                dependencies: f
+                                    .dependencies
+                                    .iter()
+                                    .filter(|d| {
+                                        d.kind == DepKind::Required || d.kind == DepKind::Optional
+                                    })
+                                    .map(|d| LockDep {
+                                        id: d.project_id.clone(),
+                                        optional: d.kind == DepKind::Optional,
+                                    })
+                                    .collect(),
+                                slug: l.slug.clone(),
+                            });
+                        }
+                    }
+                    Err(e) => warnings.push(format!("curseforge cross: {e}")),
+                }
+            }
+            _ => {}
+        }
+    }
+
     if mr_lock.is_none() && cf_lock.is_none() {
         return (Err(warnings.join("; ")), warnings);
     }
@@ -444,6 +585,7 @@ async fn resolve_curseforge(
                     optional: d.kind == DepKind::Optional,
                 })
                 .collect(),
+            slug: id.to_owned(),
         },
     ))
 }
@@ -496,6 +638,7 @@ async fn resolve_dep_modrinth(
                             optional: d.kind == DepKind::Optional,
                         })
                         .collect(),
+                    slug: slug.clone(),
                 }),
                 Err(e) => {
                     eprintln!("easypacker: cf files for dep {slug}: {e}");
@@ -594,7 +737,7 @@ async fn resolve_dep_curseforge(
     };
 
     Ok(LockEntry {
-        id: slug,
+        id: slug.clone(),
         name: title,
         version: f.display_name.clone(),
         modrinth: mr_lock,
@@ -614,6 +757,7 @@ async fn resolve_dep_curseforge(
                     optional: d.kind == DepKind::Optional,
                 })
                 .collect(),
+            slug: slug.clone(),
         }),
     })
 }

@@ -27,6 +27,7 @@ fn sample_lock() -> Lock {
                 size: 2,
                 hashes: LockHashes::new(Some("ccc".into()), None, Some("ddd".into())),
                 dependencies: vec![],
+                slug: "sodium".into(),
             }),
         }],
         resourcepack: vec![],

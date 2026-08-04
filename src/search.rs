@@ -1655,6 +1655,8 @@ pub(crate) async fn start_dependency_fetch(
             };
             rows.push(DepRow {
                 id,
+                project_id: d.project_id.clone(),
+                platform: d.platform.clone(),
                 title,
                 optional: d.kind == DepKind::Optional,
                 enabled: d.kind != DepKind::Optional,
@@ -1669,13 +1671,17 @@ pub(crate) async fn start_dependency_fetch(
         let cwd = std::env::current_dir().unwrap_or_default();
         let manifest = crate::project::Manifest::load(&cwd).ok();
         for row in rows.iter_mut() {
-            let pinned = manifest
-                .as_ref()
-                .and_then(|m| m.cat("mod").get(&row.id))
-                .and_then(|spec| spec.shared_version());
-            if let Some(pin) = pinned {
-                if row.versions.iter().any(|v| v.name == pin) {
-                    row.version = Some(pin);
+            let spec = manifest.as_ref().and_then(|m| m.cat("mod").get(&row.id));
+            // A dep present in the manifest was previously enabled/pinned:
+            // reflect that state (pinned version + enabled optional).
+            if let Some(spec) = spec {
+                if let Some(pin) = spec.shared_version() {
+                    if row.versions.iter().any(|v| v.name == pin) {
+                        row.version = Some(pin);
+                    }
+                }
+                if row.optional {
+                    row.enabled = true;
                 }
             }
         }
@@ -1700,7 +1706,7 @@ pub(crate) fn render_dependency_popup(frame: &mut Frame, app: &App) {
     let popup = Rect::new(x, y, w, h);
     frame.render_widget(ratatui::widgets::Clear, popup);
 
-    let title = " Dependencies — ↑↓:select  Enter:versions  Space:toggle optional  a:apply  Esc:back ";
+    let title = " Dependencies — ↑↓:select  Enter:versions  Space:toggle optional  Esc:back ";
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)

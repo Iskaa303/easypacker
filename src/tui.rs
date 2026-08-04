@@ -295,7 +295,7 @@ async fn run(
                 } => {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let manifest = project::Manifest::load(&cwd).ok();
-                    let already = manifest
+                    let in_manifest = manifest
                         .as_ref()
                         .map(|m| {
                             m.contains(
@@ -305,7 +305,16 @@ async fn run(
                             )
                         })
                         .unwrap_or(false);
-                    let added_index = if already {
+                    // Lockfile-only deps (auto-resolved, not in the manifest)
+                    // still count as added, and their pinned version should be
+                    // marked as selected in the file list.
+                    let lock_ver = lock::read_lock_version(
+                        &cwd,
+                        modrinth_slug.as_deref(),
+                        curseforge_id.map(i64::from),
+                    );
+                    let already = in_manifest || lock_ver.is_some();
+                    let added_index = if in_manifest {
                         manifest.and_then(|m| {
                             let ver = m.version_of(
                                 &project_type,
@@ -315,7 +324,7 @@ async fn run(
                             files.iter().position(|f| f.name == ver)
                         })
                     } else {
-                        None
+                        lock_ver.and_then(|ver| files.iter().position(|f| f.name == ver))
                     };
                     app.file_browse = Some(FileBrowseState {
                         project_title,
@@ -889,56 +898,74 @@ async fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync:
             }
         }
         KeyCode::Char('v') => {
-            let Some(ref mut dep) = app.dependencies else { return };
             if in_picker {
-                // Commit chosen version (index 0 = default).
-                let pick = dep.version_picker.clone();
-                if let Some(vp) = pick {
-                    let row = &mut dep.rows[vp.row];
-                    row.version = if vp.selected == 0 {
+                // Commit chosen version (index 0 = default) and persist it.
+                let (row_idx, selected) = {
+                    let dep = app.dependencies.as_ref().unwrap();
+                    let vp = dep.version_picker.as_ref().unwrap();
+                    (vp.row, vp.selected)
+                };
+                {
+                    let dep = app.dependencies.as_mut().unwrap();
+                    let row = &mut dep.rows[row_idx];
+                    row.version = if selected == 0 {
                         None
                     } else {
-                        row.versions.get(vp.selected - 1).map(|f| f.name.clone())
+                        row.versions.get(selected - 1).map(|f| f.name.clone())
                     };
                     dep.version_picker = None;
                 }
+                apply_dependencies(app);
             } else {
-                let sel = dep.selected;
-                if let Some(row) = dep.rows.get(sel) {
-                    if !row.versions.is_empty() {
-                        // Pre-select the row's current version (default = 0).
-                        let selected = row
-                            .version
-                            .as_ref()
-                            .and_then(|v| row.versions.iter().position(|f| f.name == *v))
-                            .map(|i| i + 1)
-                            .unwrap_or(0);
-                        dep.version_picker = Some(DepVersionPicker {
-                            row: sel,
-                            selected,
-                            scroll: selected.saturating_sub(4),
-                        });
-                    }
+                let sel = app.dependencies.as_ref().unwrap().selected;
+                let has_versions = app
+                    .dependencies
+                    .as_ref()
+                    .and_then(|d| d.rows.get(sel))
+                    .map_or(false, |r| !r.versions.is_empty());
+                if has_versions {
+                    // Pre-select the row's current version (default = 0).
+                    let selected = app
+                        .dependencies
+                        .as_ref()
+                        .and_then(|d| d.rows.get(sel))
+                        .and_then(|r| {
+                            r.version.as_ref().and_then(|v| {
+                                r.versions.iter().position(|f| f.name == *v)
+                            })
+                        })
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    app.dependencies.as_mut().unwrap().version_picker = Some(DepVersionPicker {
+                        row: sel,
+                        selected,
+                        scroll: selected.saturating_sub(4),
+                    });
                 }
             }
         }
         // Enter on a dependency opens its version list (like a normal mod's
-        // file browse); Enter inside the list picks the highlighted version.
+        // file browse); Enter inside the list picks + persists the version.
         KeyCode::Enter => {
-            let Some(ref mut dep) = app.dependencies else { return };
             if in_picker {
-                // Commit chosen version (index 0 = default).
-                let pick = dep.version_picker.clone();
-                if let Some(vp) = pick {
-                    let row = &mut dep.rows[vp.row];
-                    row.version = if vp.selected == 0 {
+                // Commit chosen version (index 0 = default) and persist it.
+                let (row_idx, selected) = {
+                    let dep = app.dependencies.as_ref().unwrap();
+                    let vp = dep.version_picker.as_ref().unwrap();
+                    (vp.row, vp.selected)
+                };
+                {
+                    let dep = app.dependencies.as_mut().unwrap();
+                    let row = &mut dep.rows[row_idx];
+                    row.version = if selected == 0 {
                         None
                     } else {
-                        row.versions.get(vp.selected - 1).map(|f| f.name.clone())
+                        row.versions.get(selected - 1).map(|f| f.name.clone())
                     };
                     dep.version_picker = None;
                 }
-            } else if let Some(row) = dep.rows.get(dep.selected) {
+                apply_dependencies(app);
+            } else if let Some(row) = app.dependencies.as_ref().and_then(|d| d.rows.get(d.selected)) {
                 if !row.versions.is_empty() {
                     let selected = row
                         .version
@@ -946,8 +973,9 @@ async fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync:
                         .and_then(|v| row.versions.iter().position(|f| f.name == *v))
                         .map(|i| i + 1)
                         .unwrap_or(0);
-                    dep.version_picker = Some(DepVersionPicker {
-                        row: dep.selected,
+                    let idx = app.dependencies.as_ref().unwrap().selected;
+                    app.dependencies.as_mut().unwrap().version_picker = Some(DepVersionPicker {
+                        row: idx,
                         selected,
                         scroll: selected.saturating_sub(4),
                     });
@@ -955,65 +983,107 @@ async fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync:
             }
         }
         KeyCode::Char(' ') => {
-            let Some(ref mut dep) = app.dependencies else { return };
             if !in_picker {
-                if let Some(row) = dep.rows.get_mut(dep.selected) {
-                    if row.optional {
-                        row.enabled = !row.enabled;
+                let idx = app.dependencies.as_ref().unwrap().selected;
+                let toggled = {
+                    let dep = app.dependencies.as_mut().unwrap();
+                    match dep.rows.get_mut(idx) {
+                        Some(row) if row.optional => {
+                            row.enabled = !row.enabled;
+                            true
+                        }
+                        _ => false,
                     }
+                };
+                // Persist the toggle immediately.
+                if toggled {
+                    apply_dependencies(app);
                 }
-            }
-        }
-        KeyCode::Char('a') => {
-            if !in_picker {
-                apply_dependencies(app);
-                app.dependencies = None;
             }
         }
         _ => {}
     }
 }
 
-/// Write the player's dependency choices into the manifest: deps the player
-/// pinned to a specific version (or enabled optional deps) become plain mod
-/// entries — that's the ONLY way a dep version choice persists. Deps left at
-/// default are not written; lockfile generation resolves them to the highest
-/// matching version. Then rebuild the lock (purely TOML-derived).
+/// Reconcile the player's dependency choices against the manifest: deps the
+/// player pinned a version for (or enabled optional deps) become mod entries
+/// scoped to the platform they came from — so the version name is only matched
+/// against the right platform and the counterpart platform is cross-resolved
+/// by the lockfile like any normal mod. Deps the player unpinned/untoggled
+/// are removed from the manifest. Then rebuild the lock (purely TOML-derived).
 fn apply_dependencies(app: &mut App) {
     let Some(ref dep_state) = app.dependencies else { return };
     let Some(ref fb) = app.file_browse else { return };
     let cat = fb.project_type.clone();
 
-    // Rows to persist: any dep the player pinned a version for, plus enabled
-    // optional deps (which need a manifest entry to be included at all).
-    // Picking a version always writes — even for optional deps that weren't
-    // explicitly toggled — so the choice survives.
-    let mut to_add: Vec<(String, project::ModSpec)> = Vec::new();
+    // Decide per row: insert (platform-scoped spec) or remove.
+    let mut to_insert: Vec<(String, project::ModSpec)> = Vec::new();
+    let mut to_remove: Vec<String> = Vec::new();
     for row in &dep_state.rows {
         let pinned = row.version.is_some();
         if pinned || (row.enabled && row.optional) {
-            let spec = match &row.version {
-                Some(v) => project::ModSpec::Simple(v.clone()),
-                // Enabled optional at default version: no version pin, so the
-                // lock resolves the highest matching. Keyed by the slug, which
-                // the lock treats as the modrinth slug.
-                None => project::ModSpec::Detailed(project::DetailedSpec {
-                    version: None,
-                    modrinth: Some(project::ModrinthSpec {
-                        slug: Some(row.id.clone()),
+            // Scope to the platform the dep was declared on: a version name
+            // from modrinth (e.g. "1.21-89-neoforge") only matches modrinth;
+            // the lockfile cross-resolves the other platform like a normal mod.
+            let spec = match (&row.platform, &row.version) {
+                (Platform::Modrinth, Some(v)) => project::ModSpec::Detailed(
+                    project::DetailedSpec {
                         version: None,
-                    }),
-                    curseforge: None,
-                }),
+                        modrinth: Some(project::ModrinthSpec {
+                            slug: Some(row.id.clone()),
+                            version: Some(v.clone()),
+                        }),
+                        curseforge: None,
+                    },
+                ),
+                (Platform::CurseForge, Some(v)) => project::ModSpec::Detailed(
+                    project::DetailedSpec {
+                        version: None,
+                        modrinth: None,
+                        curseforge: Some(project::CurseForgeSpec {
+                            project_id: row.project_id.parse::<i64>().ok(),
+                            version: Some(v.clone()),
+                        }),
+                    },
+                ),
+                // Enabled optional at default version: no pin, resolve the
+                // highest matching on the platform it came from.
+                (Platform::Modrinth, None) => project::ModSpec::Detailed(
+                    project::DetailedSpec {
+                        version: None,
+                        modrinth: Some(project::ModrinthSpec {
+                            slug: Some(row.id.clone()),
+                            version: None,
+                        }),
+                        curseforge: None,
+                    },
+                ),
+                (Platform::CurseForge, None) => project::ModSpec::Detailed(
+                    project::DetailedSpec {
+                        version: None,
+                        modrinth: None,
+                        curseforge: Some(project::CurseForgeSpec {
+                            project_id: row.project_id.parse::<i64>().ok(),
+                            version: None,
+                        }),
+                    },
+                ),
             };
-            to_add.push((row.id.clone(), spec));
+            to_insert.push((row.id.clone(), spec));
+        } else {
+            // Untoggled optional or reset-to-default: drop the manifest entry
+            // so it stops being pinned (the lock resolves it fresh / skips it).
+            to_remove.push(row.id.clone());
         }
     }
 
     let cwd = std::env::current_dir().unwrap_or_default();
     if let Ok(mut manifest) = project::Manifest::load(&cwd) {
-        for (dep_id, spec) in to_add {
+        for (dep_id, spec) in to_insert {
             manifest.cat_mut(&cat).insert(dep_id, spec);
+        }
+        for dep_id in to_remove {
+            manifest.cat_mut(&cat).remove(&dep_id);
         }
         if manifest.save(&cwd).is_ok() {
             app.project = Some(manifest);
