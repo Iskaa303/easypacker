@@ -463,6 +463,7 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                             modrinth_url: mv.url,
                             curseforge_file_id: None,
                             curseforge_url: None,
+                            dependencies: mv.dependencies,
                         };
                         let lower = pf.name.to_lowercase();
                         if let Some(existing) = all_files
@@ -524,6 +525,7 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                                 modrinth_url: None,
                                 curseforge_file_id: Some(cf.id),
                                 curseforge_url: cf.download_url,
+                                dependencies: cf.dependencies,
                             };
                             let lower = pf.name.to_lowercase();
                             if let Some(existing) = all_files
@@ -887,13 +889,25 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
 
         let text_x = inner.x + 8;
         let text_w = inner.width.saturating_sub(9);
-        let in_pack = app.project.as_ref().map_or(false, |m| {
+        // In-pack = present in the manifest OR pinned in the lockfile (so
+        // auto-resolved deps like patchouli show as selected too).
+        let in_manifest = app.project.as_ref().map_or(false, |m| {
             m.contains(
                 &r.project_type,
                 r.cross.modrinth_slug.as_deref(),
                 r.cross.curseforge_id.map(i64::from),
             )
         });
+        let in_lock = r
+            .cross
+            .modrinth_slug
+            .as_deref()
+            .map_or(false, |s| app.lock_slugs.contains(s))
+            || r
+                .cross
+                .curseforge_id
+                .map_or(false, |id| app.lock_cf_ids.contains(&i64::from(id)));
+        let in_pack = in_manifest || in_lock;
 
         let sel_style = if selected {
             Style::default().bg(Color::Blue).fg(Color::White)
@@ -1057,7 +1071,8 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
     use ratatui::text::Span as TitleSpan;
     let header = Line::from(vec![
         TitleSpan::raw(format!(" {}{} — Esc:back  ↑↓:scroll  Enter:add/remove  ", fb.project_title, added)),
-        TitleSpan::styled("l:link other platform", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        TitleSpan::styled("l:link other platform ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        TitleSpan::styled("d:dependencies ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
         TitleSpan::raw(format!("  ({})", fb.files.len())),
     ]);
     let lines: Vec<Line> = fb
@@ -1416,6 +1431,7 @@ pub(crate) async fn start_link_file_fetch(
                         modrinth_url: mv.url,
                         curseforge_file_id: None,
                         curseforge_url: None,
+                        dependencies: mv.dependencies,
                     });
                 }
             }
@@ -1452,6 +1468,7 @@ pub(crate) async fn start_link_file_fetch(
                         modrinth_url: None,
                         curseforge_file_id: Some(cf.id),
                         curseforge_url: cf.download_url,
+                        dependencies: cf.dependencies,
                     });
                 }
             }
@@ -1469,4 +1486,371 @@ pub(crate) async fn start_link_file_fetch(
             .collect();
         let _ = tx.send(AppEvent::LinkFiles { files: filtered }).await;
     });
+}
+
+// ── Dependency popup ───────────────────────────────────────
+
+use crate::api::types::{Dependency, DepKind};
+
+/// Fetch titles + available versions for each dependency of the selected file,
+/// filtered to the project's mc/loader, then send a `DepsLoaded` event.
+pub(crate) async fn start_dependency_fetch(
+    app: &mut App,
+    cfg: &Config,
+    tx: &tokio::sync::mpsc::Sender<AppEvent>,
+) {
+    let Some(ref fb) = app.file_browse else {
+        return;
+    };
+    let file = match fb.files.get(fb.selected) {
+        Some(f) => f.clone(),
+        None => return,
+    };
+    // Collapse duplicate dep ids across platforms (a mod may be on both).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let deps: Vec<Dependency> = file
+        .dependencies
+        .iter()
+        .filter(|d| seen.insert(d.project_id.clone()))
+        .filter(|d| d.kind != DepKind::Incompatible)
+        .cloned()
+        .collect();
+    if deps.is_empty() {
+        app.dependencies = Some(DependencyState {
+            rows: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            status: Some("No dependencies declared.".into()),
+            version_picker: None,
+        });
+        return;
+    }
+
+    // Mark the popup as loading.
+    app.dependencies = Some(DependencyState {
+        rows: Vec::new(),
+        selected: 0,
+        scroll: 0,
+        status: Some(" Loading dependencies… ".into()),
+        version_picker: None,
+    });
+
+    let mc = app
+        .project
+        .as_ref()
+        .map(|p| p.project.minecraft.clone())
+        .unwrap_or_default();
+    let loader = if fb.project_type == "mod" {
+        app.project
+            .as_ref()
+            .map(|p| p.project.loader.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let api_key = cfg.get_api_key(None).ok();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let mut rows: Vec<DepRow> = Vec::new();
+        for d in deps {
+            let versions: Vec<ProjectFile> = match d.platform {
+                Platform::Modrinth => {
+                    match ModrinthClient::get_versions(
+                        &d.project_id,
+                        if mc.is_empty() { None } else { Some(&mc) },
+                        if loader.is_empty() { None } else { Some(&loader) },
+                    )
+                    .await
+                    {
+                        Ok(vs) => vs
+                            .into_iter()
+                            .map(|v| ProjectFile {
+                                name: v.name,
+                                mc_versions: v.game_versions,
+                                loaders: v.loaders,
+                                date_published: v.date_published,
+                                downloads: v.downloads,
+                                size: v.size,
+                                url: v.url.clone(),
+                                platforms: vec![Platform::Modrinth],
+                                modrinth_version_id: Some(v.id),
+                                modrinth_url: v.url,
+                                curseforge_file_id: None,
+                                curseforge_url: None,
+                                dependencies: Vec::new(),
+                            })
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                Platform::CurseForge => {
+                    let Some(ref key) = api_key else {
+                        continue;
+                    };
+                    let Ok(mod_id) = d.project_id.parse::<i32>() else {
+                        continue;
+                    };
+                    let client = CurseForgeClient::new(key);
+                    match client.get_files(mod_id, None, None).await {
+                        Ok(fs) => fs
+                            .into_iter()
+                            .filter(|f| version_matches(f.game_versions.as_slice(), &mc))
+                            .map(|f| {
+                                let known: Vec<&str> = filters::LOADERS.to_vec();
+                                let loaders: Vec<String> = f
+                                    .game_versions
+                                    .iter()
+                                    .filter(|v| known.iter().any(|l| v.eq_ignore_ascii_case(l)))
+                                    .map(|v| v.to_lowercase())
+                                    .collect();
+                                let mc_versions: Vec<String> = f
+                                    .game_versions
+                                    .iter()
+                                    .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
+                                    .cloned()
+                                    .collect();
+                                ProjectFile {
+                                    name: f.display_name,
+                                    mc_versions,
+                                    loaders,
+                                    date_published: f.file_date,
+                                    downloads: f.download_count,
+                                    size: f.file_length,
+                                    url: f.download_url.clone(),
+                                    platforms: vec![Platform::CurseForge],
+                                    modrinth_version_id: None,
+                                    modrinth_url: None,
+                                    curseforge_file_id: Some(f.id),
+                                    curseforge_url: f.download_url,
+                                    dependencies: Vec::new(),
+                                }
+                            })
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    }
+                }
+            };
+            // Resolve the easypacker id (modrinth slug / cf slug) + display
+            // title in one call; fall back to the raw project id.
+            let (id, title) = match d.platform {
+                Platform::Modrinth => {
+                    match ModrinthClient::get_project(&d.project_id).await {
+                        Ok(p) => (p.slug, p.title),
+                        Err(_) => (d.project_id.clone(), d.project_id.clone()),
+                    }
+                }
+                Platform::CurseForge => match api_key.as_ref() {
+                    Some(key) => {
+                        if let Ok(mod_id) = d.project_id.parse::<i32>() {
+                            match CurseForgeClient::new(key).get_mod(mod_id).await {
+                                Ok((_, name, slug)) => (slug, name),
+                                Err(_) => (d.project_id.clone(), d.project_id.clone()),
+                            }
+                        } else {
+                            (d.project_id.clone(), d.project_id.clone())
+                        }
+                    }
+                    None => (d.project_id.clone(), d.project_id.clone()),
+                },
+            };
+            rows.push(DepRow {
+                id,
+                title,
+                optional: d.kind == DepKind::Optional,
+                enabled: d.kind != DepKind::Optional,
+                version: None,
+                versions,
+            });
+        }
+        // Pre-select the version pinned in the manifest (from a previous
+        // apply) when it's one of the available versions; otherwise the
+        // default is latest (first). Deps not in the manifest default to
+        // latest.
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let manifest = crate::project::Manifest::load(&cwd).ok();
+        for row in rows.iter_mut() {
+            let pinned = manifest
+                .as_ref()
+                .and_then(|m| m.cat("mod").get(&row.id))
+                .and_then(|spec| spec.shared_version());
+            if let Some(pin) = pinned {
+                if row.versions.iter().any(|v| v.name == pin) {
+                    row.version = Some(pin);
+                }
+            }
+        }
+        let _ = tx.send(AppEvent::DepsLoaded { rows }).await;
+    });
+}
+
+fn version_matches(versions: &[String], want: &str) -> bool {
+    want.is_empty() || versions.iter().any(|v| v == want)
+}
+
+/// Full-screen overlay popup listing required + optional dependencies.
+pub(crate) fn render_dependency_popup(frame: &mut Frame, app: &App) {
+    let Some(ref dep) = app.dependencies else {
+        return;
+    };
+    let area = frame.area();
+    let w = (area.width * 4 / 5).max(64).min(area.width);
+    let h = (area.height * 4 / 5).max(12).min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+    frame.render_widget(ratatui::widgets::Clear, popup);
+
+    let title = " Dependencies — ↑↓:select  Enter:versions  Space:toggle optional  a:apply  Esc:back ";
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(popup);
+    frame.render_widget(&block, popup);
+
+    if let Some(status) = &dep.status {
+        frame.render_widget(
+            Paragraph::new(Span::styled(status, Style::default().fg(Color::Yellow)))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+
+    // Optional sub-popup (version picker) draws over the list.
+    let body_h = inner.height as usize;
+    let total = dep.rows.len();
+
+    let mut lines: Vec<Line> = Vec::new();
+    let header_line = Line::from(vec![
+        Span::styled(
+            "Required dependencies are pinned automatically; ",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            "optional ones ",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            "need enabling",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::UNDERLINED),
+        ),
+        Span::styled(".", Style::default().fg(Color::DarkGray)),
+    ]);
+    lines.push(header_line);
+    lines.push(Line::from(""));
+
+    let vis = body_h.saturating_sub(2);
+    for i in 0..vis {
+        let idx = dep.scroll + i;
+        if idx >= total {
+            break;
+        }
+        let row = &dep.rows[idx];
+        let is_sel = idx == dep.selected;
+        let bg = if is_sel {
+            Style::default().bg(Color::Blue).fg(Color::White)
+        } else {
+            Style::default()
+        };
+        let prefix = if is_sel { "▸ " } else { "  " };
+        let kind_label = if row.optional {
+            Span::styled("[opt] ", bg.fg(if is_sel { Color::Cyan } else { Color::Magenta }))
+        } else {
+            Span::styled("[req] ", bg.fg(if is_sel { Color::Green } else { Color::DarkGray }))
+        };
+        let state_mark = if row.optional {
+            Span::styled(
+                if row.enabled { "◉ " } else { "○ " },
+                bg.fg(if row.enabled { Color::Green } else { Color::DarkGray }),
+            )
+        } else {
+            Span::styled("● ", bg.fg(Color::Green))
+        };
+        let name_span = Span::styled(row.title.clone(), bg.add_modifier(Modifier::BOLD));
+        let ver_label = Span::styled(
+            format!("  {}", row.version.clone().unwrap_or_else(|| "default".into())),
+            bg.fg(Color::DarkGray),
+        );
+        lines.push(Line::from(vec![
+            Span::styled(prefix, bg),
+            kind_label,
+            state_mark,
+            name_span,
+            ver_label,
+            Span::styled(
+                format!("  ({} versions)", row.versions.len()),
+                bg.fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    let list_area = if dep.version_picker.is_some() {
+        Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(8))
+    } else {
+        inner
+    };
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        list_area,
+    );
+
+    // Version picker sub-popup (bottom-right), over the list. Renders the
+    // dep's versions like a normal file-browse list.
+    if let Some(ref vp) = dep.version_picker {
+        let row = &dep.rows[vp.row];
+        let title = format!(" Versions for {} (Enter:pick, Esc:back) ", row.title);
+        let pw = (inner.width * 3 / 4).max(50);
+        let ph = (inner.height * 2 / 3).max(10).min(inner.height.saturating_sub(2));
+        let px = inner.x + (inner.width.saturating_sub(pw)) / 2;
+        let py = inner.y + (inner.height.saturating_sub(ph)) / 2;
+        let parea = Rect::new(px, py, pw, ph);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title.as_str())
+            .border_style(Style::default().fg(Color::Yellow));
+        let pinner = block.inner(parea);
+        frame.render_widget(&block, parea);
+        let mut vlines: Vec<Line> = Vec::new();
+        // First entry = default (latest matching).
+        let total = row.versions.len() + 1;
+        let rows_avail = pinner.height as usize;
+        let start = vp.scroll.min(total.saturating_sub(rows_avail));
+        for i in start..total.min(start + rows_avail) {
+            let is_sel = i == vp.selected;
+            let bg = if is_sel {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            let prefix = if is_sel { "▸ " } else { "  " };
+            if i == 0 {
+                vlines.push(Line::from(Span::styled(
+                    format!("{prefix}(default — latest matching)"),
+                    bg,
+                )));
+                continue;
+            }
+            if let Some(f) = row.versions.get(i - 1) {
+                let mc = f.mc_versions.first().map(|s| s.as_str()).unwrap_or("-");
+                let loaders = f.loaders.join(", ");
+                let date = &f.date_published[..f.date_published.len().min(10)];
+                let mut spans = vec![
+                    Span::styled(prefix, bg),
+                    Span::styled(f.name.clone(), bg.add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  MC:{mc}"), bg.fg(Color::Yellow)),
+                ];
+                if !loaders.is_empty() {
+                    spans.push(Span::styled(format!("  {loaders}"), bg.fg(Color::Magenta)));
+                }
+                spans.push(Span::styled(format!("  {date}"), bg.fg(Color::DarkGray)));
+                spans.push(Span::styled(format!("  {}↓", f.downloads), bg.fg(Color::Green)));
+                vlines.push(Line::from(spans));
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(vlines).wrap(Wrap { trim: false }),
+            pinner,
+        );
+    }
 }

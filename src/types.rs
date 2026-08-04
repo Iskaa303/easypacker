@@ -77,6 +77,40 @@ pub(crate) struct PickedProject {
     pub curseforge_id: Option<i32>,
 }
 
+/// One discovered dependency for the dependency popup.
+#[derive(Clone)]
+pub(crate) struct DepRow {
+    /// easypacker id = manifest key = modrinth slug (or cf slug/name).
+    pub id: String,
+    pub title: String,
+    /// true if the parent declared it optional. Optional deps start disabled;
+    /// the player toggles them on. Required deps start enabled.
+    pub optional: bool,
+    pub enabled: bool,
+    /// Player's chosen version display name (default = first/latest).
+    pub version: Option<String>,
+    /// Available versions, rendered like a normal file-browse list.
+    pub versions: Vec<ProjectFile>,
+}
+
+/// Dependency popup: lists required + optional deps for the browsed mod,
+/// lets the player enable optional deps and pin specific versions.
+pub(crate) struct DependencyState {
+    pub rows: Vec<DepRow>,
+    pub selected: usize,
+    pub scroll: usize,
+    pub status: Option<String>,
+    /// When Some, a sub-popup lists versions for `rows[selected]`.
+    pub version_picker: Option<DepVersionPicker>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DepVersionPicker {
+    pub row: usize,
+    pub selected: usize,
+    pub scroll: usize,
+}
+
 pub(crate) struct FiltersState {
     pub version: String,
     pub loader: String,
@@ -128,6 +162,9 @@ pub(crate) enum AppEvent {
     },
     LinkFiles {
         files: Vec<ProjectFile>,
+    },
+    DepsLoaded {
+        rows: Vec<DepRow>,
     },
 }
 #[derive(Clone, PartialEq)]

@@ -151,3 +151,48 @@ fn init_writes_user_facing_shape() {
     assert!(raw.contains("[project.links]"));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn renders_and_roundtrips_dependency_overrides() {
+    // Deps become plain manifest mod entries (keyed by slug) — no
+    // `dependencies` field ever appears in the TOML.
+    let m: Manifest = toml::from_str(
+        r#"
+[project]
+name = "x"
+minecraft = "1.21.1"
+loader = "neoforge"
+
+[mods]
+iceandfire = { modrinth = { slug = "iceandfire", version = "2.1" } }
+patchouli = { modrinth = { slug = "patchouli", version = "1.21.1-93" } }
+"#,
+    )
+    .unwrap();
+    let out = m.render();
+    // No sub-tables, no dependencies field.
+    assert!(!out.contains("[mods.iceandfire]"), "sub-table leaked:\n{out}");
+    assert!(!out.contains("dependencies"), "dependencies leaked into manifest:\n{out}");
+    // round-trips.
+    let m2: Manifest = toml::from_str(&out).unwrap();
+    assert!(matches!(&m2.mods["patchouli"], ModSpec::Detailed(_)));
+}
+
+#[test]
+fn default_deps_absent_from_render() {
+    // No `dependencies` map => nothing about deps appears in the TOML.
+    let m: Manifest = toml::from_str(
+        r#"
+[project]
+name = "x"
+minecraft = "1.21.1"
+loader = "neoforge"
+
+[mods]
+sodium = "Sodium 0.8.12"
+"#,
+    )
+    .unwrap();
+    let out = m.render();
+    assert!(!out.contains("dependencies"));
+}

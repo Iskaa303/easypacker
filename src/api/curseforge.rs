@@ -1,4 +1,4 @@
-use super::types::{CrossPlatform, Platform, SearchFilters, SearchResult};
+use super::types::{CrossPlatform, Dependency, DepKind, Platform, SearchFilters, SearchResult};
 use color_eyre::eyre::Result;
 use serde::Deserialize;
 use std::time::Duration;
@@ -57,12 +57,23 @@ struct CurseForgeFile {
     download_url: Option<String>,
     #[serde(default)]
     hashes: Vec<FileHash>,
+    #[serde(default)]
+    dependencies: Vec<CurseForgeDep>,
 }
 
 #[derive(Deserialize)]
 struct FileHash {
     algo: i32,
     value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeDep {
+    #[serde(default)]
+    mod_id: Option<i32>,
+    #[serde(default)]
+    relation_type: i32,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +93,7 @@ pub struct CurseForgeFileInfo {
     pub download_url: Option<String>,
     pub sha1: Option<String>,
     pub md5: Option<String>,
+    pub dependencies: Vec<Dependency>,
 }
 
 #[derive(Deserialize)]
@@ -311,9 +323,43 @@ impl CurseForgeClient {
                     download_url: f.download_url,
                     sha1: hash(1),
                     md5: hash(2),
+                    dependencies: f
+                        .dependencies
+                        .into_iter()
+                        .filter_map(|d| {
+                            d.mod_id.map(|mid| Dependency {
+                                project_id: mid.to_string(),
+                                version_id: None,
+                                kind: match d.relation_type {
+                                    2 => DepKind::Optional,
+                                    5 => DepKind::Incompatible,
+                                    // 1 (embedded), 3 (required), 4 (tool), 6 (include)
+                                    _ => DepKind::Required,
+                                },
+                                platform: Platform::CurseForge,
+                            })
+                        })
+                        .collect(),
                 }
             })
             .collect())
+    }
+    /// Fetch a single mod by its numeric id. Returns (mod id, display name, slug).
+    pub async fn get_mod(&self, mod_id: i32) -> Result<(i32, String, String)> {
+        // The endpoint wraps the mod in a `data` key.
+        #[derive(Deserialize)]
+        struct ModResponse {
+            data: ModData,
+        }
+        let resp: ModResponse = self
+            .client
+            .get(format!("{}/mods/{mod_id}", BASE))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok((resp.data.id, resp.data.name, resp.data.slug))
     }
 }
 

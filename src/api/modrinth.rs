@@ -1,4 +1,4 @@
-use super::types::{CrossPlatform, Platform, SearchFilters, SearchResult};
+use super::types::{CrossPlatform, Dependency, DepKind, Platform, SearchFilters, SearchResult};
 use crate::api::filters;
 use color_eyre::eyre::Result;
 use serde::Deserialize;
@@ -44,6 +44,8 @@ struct ModrinthVersion {
     downloads: u64,
     #[serde(default)]
     files: Vec<ModrinthVersionFile>,
+    #[serde(default)]
+    dependencies: Vec<ModrinthDep>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +59,16 @@ struct ModrinthVersionFile {
     primary: Option<bool>,
     #[serde(default)]
     hashes: std::collections::HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct ModrinthDep {
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    version_id: Option<String>,
+    #[serde(default)]
+    dependency_type: String,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +92,7 @@ pub struct ModrinthVersionInfo {
     pub size: u64,
     pub sha1: Option<String>,
     pub sha512: Option<String>,
+    pub dependencies: Vec<Dependency>,
 }
 
 impl ModrinthClient {
@@ -226,6 +239,22 @@ impl ModrinthClient {
                     size: primary.map_or(0, |f| f.size),
                     sha1: primary.and_then(|f| f.hashes.get("sha1").cloned()),
                     sha512: primary.and_then(|f| f.hashes.get("sha512").cloned()),
+                    dependencies: v
+                        .dependencies
+                        .into_iter()
+                        .filter_map(|d| {
+                            d.project_id.map(|pid| Dependency {
+                                project_id: pid,
+                                version_id: d.version_id,
+                                kind: match d.dependency_type.as_str() {
+                                    "optional" => DepKind::Optional,
+                                    "incompatible" => DepKind::Incompatible,
+                                    _ => DepKind::Required,
+                                },
+                                platform: Platform::Modrinth,
+                            })
+                        })
+                        .collect(),
                 }
             })
             .collect())

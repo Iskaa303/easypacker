@@ -3,10 +3,11 @@
 //! Regenerated on every run; never edit by hand (cargo-style).
 
 use crate::api::{CurseForgeClient, ModrinthClient};
+use crate::api::types::{DepKind, Platform};
 use crate::config::Config;
 use crate::project::{CATEGORIES, Manifest, ModSpec, tstr};
 use color_eyre::eyre::{Result, bail};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -40,6 +41,8 @@ struct LockModrinth {
     url: Option<String>,
     size: u64,
     hashes: Option<LockHashes>,
+    /// ids this version depends on.
+    dependencies: Vec<LockDep>,
 }
 
 struct LockCurseForge {
@@ -49,12 +52,20 @@ struct LockCurseForge {
     url: Option<String>,
     size: u64,
     hashes: Option<LockHashes>,
+    /// ids this file depends on.
+    dependencies: Vec<LockDep>,
 }
 
 struct LockHashes {
     sha1: Option<String>,
     sha512: Option<String>,
     md5: Option<String>,
+}
+
+#[derive(Clone)]
+struct LockDep {
+    id: String,
+    optional: bool,
 }
 
 impl LockHashes {
@@ -72,7 +83,47 @@ pub struct Report {
     pub failed: usize,
 }
 
-/// Resolve every manifest entry and rewrite Easypacker.lock.
+/// Collect the project ids present in an existing lockfile, so the search
+/// results can mark deps that are in the pack even when they're only in the
+/// lockfile (not in the manifest). Returns (modrinth slugs, curseforge ids).
+pub fn read_known_ids(dir: &Path) -> (std::collections::HashSet<String>, std::collections::HashSet<i64>) {
+    let mut slugs = std::collections::HashSet::new();
+    let mut cf_ids = std::collections::HashSet::new();
+    let Ok(raw) = std::fs::read_to_string(dir.join(LOCK_FILE)) else {
+        return (slugs, cf_ids);
+    };
+    let Ok(toml) = toml::from_str::<toml::Value>(&raw) else {
+        return (slugs, cf_ids);
+    };
+    for key in ["mod", "resourcepack", "datapack", "shader"] {
+        let Some(arr) = toml.get(key).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for entry in arr {
+            if let Some(slug) = entry
+                .get("modrinth")
+                .and_then(|v| v.get("slug"))
+                .and_then(|v| v.as_str())
+            {
+                slugs.insert(slug.to_owned());
+            }
+            if let Some(pid) = entry
+                .get("curseforge")
+                .and_then(|v| v.get("project_id"))
+                .and_then(|v| v.as_integer())
+            {
+                cf_ids.insert(pid);
+            }
+        }
+    }
+    (slugs, cf_ids)
+}
+
+/// Resolve every manifest entry and rewrite Easypacker.lock. The lockfile is
+/// purely derived from the TOML manifest: deps not present in the manifest
+/// resolve to the highest matching version; deps the player pinned (via the
+/// dependency popup, which writes them into the manifest) resolve to the
+/// pinned version. UI actions never edit the lockfile directly.
 pub async fn generate(dir: &Path, cfg: &Config) -> Result<Report> {
     let manifest = Manifest::load(dir)?;
     let proj = &manifest.project;
@@ -147,6 +198,28 @@ pub async fn generate(dir: &Path, cfg: &Config) -> Result<Report> {
     }
 
     let resolved_count = resolved.len();
+    let manifest_ids: HashSet<String> = manifest
+        .mods
+        .keys()
+        .chain(manifest.resourcepacks.keys())
+        .chain(manifest.datapacks.keys())
+        .chain(manifest.shaders.keys())
+        .cloned()
+        .collect();
+
+    // Resolve transitive dependencies (cargo-style): each manifest entry
+    // declares dep ids; unresolved ones become their own lock rows.
+    let dep_entries = resolve_dependencies(
+        &mut resolved,
+        &manifest_ids,
+        &proj.minecraft,
+        &proj.loader,
+        want_mr,
+        want_cf,
+        cf.clone(),
+    )
+    .await;
+
     let (mut mods, mut resourcepacks, mut datapacks, mut shaders) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for ((cat, _), entry) in resolved {
@@ -157,6 +230,7 @@ pub async fn generate(dir: &Path, cfg: &Config) -> Result<Report> {
             _ => shaders.push(entry),
         }
     }
+    mods.extend(dep_entries);
 
     let lock = Lock {
         minecraft: proj.minecraft.clone(),
@@ -294,6 +368,15 @@ async fn resolve_modrinth(
             url: v.url.clone(),
             size: v.size,
             hashes: LockHashes::new(v.sha1.clone(), v.sha512.clone(), None),
+            dependencies: v
+                .dependencies
+                .iter()
+                .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
+                .map(|d| LockDep {
+                    id: d.project_id.clone(),
+                    optional: d.kind == DepKind::Optional,
+                })
+                .collect(),
         },
     ))
 }
@@ -352,8 +435,365 @@ async fn resolve_curseforge(
             url: f.download_url.clone(),
             size: f.file_length,
             hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
+            dependencies: f
+                .dependencies
+                .iter()
+                .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
+                .map(|d| LockDep {
+                    id: d.project_id.clone(),
+                    optional: d.kind == DepKind::Optional,
+                })
+                .collect(),
         },
     ))
+}
+
+/// Resolve a transitive dependency by Modrinth project id into a lock row.
+/// Picks the highest matching version (the API returns newest first), and —
+/// when the pack targets CurseForge too — tries to attach the counterpart
+/// file so the dep is pinned on both platforms like any normal mod.
+async fn resolve_dep_modrinth(
+    dep_id: &str,
+    mc: &str,
+    loader: &str,
+    want_cf: bool,
+    cf: Option<Arc<CurseForgeClient>>,
+) -> Result<LockEntry, String> {
+    let loader_filter = if !loader.is_empty() { Some(loader) } else { None };
+    let mc_filter = if mc.is_empty() { None } else { Some(mc) };
+    let (project, versions) = tokio::join!(
+        ModrinthClient::get_project(dep_id),
+        ModrinthClient::get_versions(dep_id, mc_filter, loader_filter),
+    );
+    let project = project.map_err(|e| format!("modrinth dep {dep_id}: {e}"))?;
+    let versions = versions.map_err(|e| format!("modrinth dep {dep_id}: {e}"))?;
+    let slug = project.slug.clone();
+    let v = versions
+        .first()
+        .ok_or_else(|| format!("modrinth dep {dep_id}: version not found"))?;
+
+    // Cross-platform: try to find the same mod on CurseForge.
+    let cf_lock = if want_cf && let Some(client) = cf.as_ref() {
+        match client
+            .find_by_slug(&slug, Some(6))
+            .await
+            .map_err(|e| eprintln!("easypacker: cf lookup for dep {slug}: {e}"))
+        {
+            Ok(Some((mod_id, _))) => match client.get_files(mod_id, mc_filter, loader_filter).await {
+                Ok(files) => files.first().map(|f| LockCurseForge {
+                    project_id: i64::from(mod_id),
+                    file_id: i64::from(f.id),
+                    filename: f.file_name.clone(),
+                    url: f.download_url.clone(),
+                    size: f.file_length,
+                    hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
+                    dependencies: f
+                        .dependencies
+                        .iter()
+                        .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
+                        .map(|d| LockDep {
+                            id: d.project_id.clone(),
+                            optional: d.kind == DepKind::Optional,
+                        })
+                        .collect(),
+                }),
+                Err(e) => {
+                    eprintln!("easypacker: cf files for dep {slug}: {e}");
+                    None
+                }
+            },
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(LockEntry {
+        id: slug,
+        name: project.title,
+        version: v.name.clone(),
+        modrinth: Some(LockModrinth {
+            slug: project.slug,
+            project_id: project.id,
+            version_id: v.id.clone(),
+            filename: v.filename.clone(),
+            url: v.url.clone(),
+            size: v.size,
+            hashes: LockHashes::new(v.sha1.clone(), v.sha512.clone(), None),
+            dependencies: v
+                .dependencies
+                .iter()
+                .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
+                .map(|d| LockDep {
+                    id: d.project_id.clone(),
+                    optional: d.kind == DepKind::Optional,
+                })
+                .collect(),
+        }),
+        curseforge: cf_lock,
+    })
+}
+
+/// Resolve a transitive dependency by CurseForge mod id into a lock row.
+/// Picks the highest matching file, and — when the pack targets Modrinth
+/// too — tries to attach the counterpart version.
+async fn resolve_dep_curseforge(
+    client: &CurseForgeClient,
+    dep_id: i32,
+    mc: &str,
+    loader: &str,
+    want_mr: bool,
+) -> Result<LockEntry, String> {
+    let (mod_id, title, slug) = client
+        .get_mod(dep_id)
+        .await
+        .map_err(|e| format!("cf dep {dep_id}: {e}"))?;
+    let loader_filter = if !loader.is_empty() { Some(loader) } else { None };
+    let mc_filter = if mc.is_empty() { None } else { Some(mc) };
+    let files = client
+        .get_files(mod_id, mc_filter, loader_filter)
+        .await
+        .map_err(|e| format!("cf dep {dep_id}: {e}"))?;
+    let f = files
+        .first()
+        .ok_or_else(|| format!("cf dep {dep_id}: version not found"))?;
+
+    // Cross-platform: try to find the same mod on Modrinth.
+    let mr_lock = if want_mr {
+        match ModrinthClient::get_project(&slug).await {
+            Ok(project) => {
+                match ModrinthClient::get_versions(&slug, mc_filter, loader_filter).await {
+                    Ok(versions) => versions.first().map(|v| LockModrinth {
+                        slug: project.slug.clone(),
+                        project_id: project.id,
+                        version_id: v.id.clone(),
+                        filename: v.filename.clone(),
+                        url: v.url.clone(),
+                        size: v.size,
+                        hashes: LockHashes::new(v.sha1.clone(), v.sha512.clone(), None),
+                        dependencies: v
+                            .dependencies
+                            .iter()
+                            .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
+                            .map(|d| LockDep {
+                                id: d.project_id.clone(),
+                                optional: d.kind == DepKind::Optional,
+                            })
+                            .collect(),
+                    }),
+                    Err(e) => {
+                        eprintln!("easypacker: mr versions for dep {slug}: {e}");
+                        None
+                    }
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(LockEntry {
+        id: slug,
+        name: title,
+        version: f.display_name.clone(),
+        modrinth: mr_lock,
+        curseforge: Some(LockCurseForge {
+            project_id: i64::from(mod_id),
+            file_id: i64::from(f.id),
+            filename: f.file_name.clone(),
+            url: f.download_url.clone(),
+            size: f.file_length,
+            hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
+            dependencies: f
+                .dependencies
+                .iter()
+                .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
+                .map(|d| LockDep {
+                    id: d.project_id.clone(),
+                    optional: d.kind == DepKind::Optional,
+                })
+                .collect(),
+        }),
+    })
+}
+
+/// Resolve direct dependencies of manifest entries into their own lock rows.
+/// Required deps are always pinned; optional deps are pinned only when the
+/// Resolve direct dependencies of manifest entries into their own lock rows.
+/// Required deps are always pinned; optional deps are only included when the
+/// player enabled them (i.e. they're manifest entries, resolved separately).
+/// Each resolved dep row uses the easypacker id (modrinth/cf slug), tries
+/// both platforms the pack targets, and resolves the highest matching
+/// version. Deps already in the manifest (pinned by the player) are skipped
+/// here — the manifest entry covers them.
+/// ponytail: one level deep — full transitive closure would walk each dep's
+/// own deps; add a visited+BFS pass when the lockfile needs the full graph.
+async fn resolve_dependencies(
+    resolved: &mut BTreeMap<(&'static str, String), LockEntry>,
+    manifest_ids: &HashSet<String>,
+    mc: &str,
+    loader: &str,
+    want_mr: bool,
+    want_cf: bool,
+    cf: Option<Arc<CurseForgeClient>>,
+) -> Vec<LockEntry> {
+    // Gather (platform, raw dep_id, optional) edges across all resolved entries.
+    let mut edges: Vec<(Platform, String, bool)> = Vec::new();
+    for e in resolved.values() {
+        if let Some(mr) = &e.modrinth {
+            for d in &mr.dependencies {
+                edges.push((Platform::Modrinth, d.id.clone(), d.optional));
+            }
+        }
+        if let Some(cf) = &e.curseforge {
+            for d in &cf.dependencies {
+                edges.push((Platform::CurseForge, d.id.clone(), d.optional));
+            }
+        }
+    }
+    edges.sort_by(|a, b| a.1.cmp(&b.1));
+    edges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    if edges.is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen: HashSet<(Platform, String)> = HashSet::new();
+    let mut set = tokio::task::JoinSet::new();
+    for (platform, dep_id, optional) in &edges {
+        if !seen.insert((platform.clone(), dep_id.clone())) {
+            continue;
+        }
+        let id_str = dep_id.clone();
+        let optional = *optional;
+        match platform {
+            Platform::Modrinth => {
+                if !want_mr {
+                    continue;
+                }
+                let mc = mc.to_owned();
+                let loader = loader.to_owned();
+                let cf = cf.clone();
+                set.spawn(async move {
+                    (
+                        Platform::Modrinth,
+                        id_str.clone(),
+                        optional,
+                        resolve_dep_modrinth(&id_str, &mc, &loader, want_cf, cf).await,
+                    )
+                });
+            }
+            Platform::CurseForge => {
+                let Some(ref client) = cf else { continue };
+                if !want_cf {
+                    continue;
+                }
+                let Ok(mod_id) = dep_id.parse::<i32>() else { continue };
+                let client = client.clone();
+                let mc = mc.to_owned();
+                let loader = loader.to_owned();
+                set.spawn(async move {
+                    (
+                        Platform::CurseForge,
+                        id_str.clone(),
+                        optional,
+                        resolve_dep_curseforge(&client, mod_id, &mc, &loader, want_mr).await,
+                    )
+                });
+            }
+        }
+    }
+
+    // raw id -> slug for every resolved dep (even ones we drop), so edges
+    // can be rewritten to readable easypacker ids.
+    let mut slug_of: std::collections::HashMap<(Platform, String), String> =
+        std::collections::HashMap::new();
+    let mut out: Vec<LockEntry> = Vec::new();
+    let mut out_slugs: HashSet<String> = HashSet::new();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((platform, raw_id, optional, Ok(entry))) => {
+                let slug = entry.id.clone();
+                slug_of.insert((platform.clone(), raw_id.clone()), slug.clone());
+                // Optional deps are only added when the player enabled them,
+                // which writes them into the manifest (resolved separately).
+                if optional && !manifest_ids.contains(&slug) {
+                    continue;
+                }
+                if !out_slugs.insert(slug.clone()) {
+                    continue;
+                }
+                if manifest_ids.contains(&slug) {
+                    continue; // already a manifest entry (resolved separately)
+                }
+                out.push(entry);
+            }
+            Ok((_, _, _, Err(e))) => eprintln!("easypacker: {e}"),
+            Err(e) => eprintln!("easypacker: dep task failed: {e}"),
+        }
+    }
+
+    // Rewrite each manifest entry's dep edges: raw id -> slug, and keep only
+    // deps that are either a manifest entry or a kept dep row.
+    let known: HashSet<String> = manifest_ids.iter().cloned().chain(out_slugs).collect();
+    for e in resolved.values_mut() {
+        rewrite_edges(e, &slug_of, &known);
+    }
+    for e in out.iter_mut() {
+        rewrite_edges(e, &slug_of, &known);
+    }
+
+    // Stable order by id for reproducible lockfiles.
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// Rewrite an entry's dependency ids from raw project ids to easypacker slugs,
+/// keeping only deps that are actually in the pack (manifest entry or dep row)
+/// AND required (optional deps never appear in the edge list).
+fn rewrite_edges(
+    e: &mut LockEntry,
+    slug_of: &std::collections::HashMap<(Platform, String), String>,
+    known: &HashSet<String>,
+) {
+    if let Some(mr) = &mut e.modrinth {
+        mr.dependencies = mr
+            .dependencies
+            .iter()
+            .filter_map(|d| {
+                if d.optional {
+                    return None;
+                }
+                let slug = slug_of
+                    .get(&(Platform::Modrinth, d.id.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| d.id.clone());
+                known.contains(&slug).then(|| LockDep {
+                    id: slug,
+                    optional: false,
+                })
+            })
+            .collect();
+    }
+    if let Some(cf) = &mut e.curseforge {
+        cf.dependencies = cf
+            .dependencies
+            .iter()
+            .filter_map(|d| {
+                if d.optional {
+                    return None;
+                }
+                let slug = slug_of
+                    .get(&(Platform::CurseForge, d.id.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| d.id.clone());
+                known.contains(&slug).then(|| LockDep {
+                    id: slug,
+                    optional: false,
+                })
+            })
+            .collect();
+    }
 }
 
 /// Render fields as a multi-line inline table (TOML 1.1), e.g.
@@ -441,11 +881,36 @@ fn render(lock: &Lock) -> String {
                 }
                 writeln!(out, "curseforge = {}", inline_table(&fields, 1)).unwrap();
             }
+            // Dependency edges (cargo-style): list the ids this entry pins,
+            // one per line like Cargo.lock.
+            let deps = collect_dep_ids(e);
+            if !deps.is_empty() {
+                writeln!(out, "dependencies = [").unwrap();
+                for d in &deps {
+                    writeln!(out, "    {},", tstr(d)).unwrap();
+                }
+                writeln!(out, "]").unwrap();
+            }
         }
     }
     out
 }
 
+/// Resolve ids declared by this entry across whichever platforms it pins.
+fn collect_dep_ids(e: &LockEntry) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(mr) = &e.modrinth {
+        ids.extend(mr.dependencies.iter().map(|d| d.id.clone()));
+    }
+    if let Some(cf) = &e.curseforge {
+        ids.extend(cf.dependencies.iter().map(|d| d.id.clone()));
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// (platform, dep id, optional) edges gathered from all resolved entries.
 #[cfg(test)]
 #[path = "../tests/lock_tests.rs"]
 mod tests;

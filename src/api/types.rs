@@ -1,7 +1,26 @@
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Platform {
     Modrinth,
     CurseForge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepKind {
+    Required,
+    Optional,
+    Incompatible,
+}
+
+/// A dependency declared by a version/file. `project_id` is the Modrinth
+/// project id OR the CurseForge modId (as a string); `version_id` is the
+/// specific version/file id the parent requires, when it pins one.
+#[derive(Debug, Clone)]
+pub struct Dependency {
+    pub project_id: String,
+    #[allow(dead_code)]
+    pub version_id: Option<String>,
+    pub kind: DepKind,
+    pub platform: Platform,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -55,4 +74,5 @@ pub struct ProjectFile {
     pub modrinth_url: Option<String>,
     pub curseforge_file_id: Option<i32>,
     pub curseforge_url: Option<String>,
+    pub dependencies: Vec<Dependency>,
 }

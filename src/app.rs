@@ -5,6 +5,7 @@ use crate::ui;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use std::cell::Cell;
+use std::collections::HashSet;
 
 pub(crate) struct App {
     // Search state
@@ -32,5 +33,10 @@ pub(crate) struct App {
     pub form_field_idx: Option<usize>,
     pub file_browse: Option<FileBrowseState>,
     pub link_version: Option<LinkVersionState>,
+    pub dependencies: Option<DependencyState>,
+    /// Modrinth slugs + CurseForge project ids present in the lockfile, so
+    /// search results can mark deps that are in the pack (lockfile-only).
+    pub lock_slugs: HashSet<String>,
+    pub lock_cf_ids: HashSet<i64>,
     pub quit_requested: bool,
 }

@@ -14,6 +14,7 @@ use crossterm::terminal::{
 };
 use ratatui::Frame;
 use ratatui_image::picker::Picker;
+use std::collections::HashSet;
 use std::io::stdout;
 
 pub async fn run_tui(_cfg: Config, project: Option<project::Manifest>) -> Result<()> {
@@ -55,6 +56,9 @@ pub async fn run_tui(_cfg: Config, project: Option<project::Manifest>) -> Result
         form_field_idx: None,
         file_browse: None,
         link_version: None,
+        dependencies: None,
+        lock_slugs: HashSet::new(),
+        lock_cf_ids: HashSet::new(),
         quit_requested: false,
     };
 
@@ -101,6 +105,11 @@ async fn run(
                             }
                             continue;
                         }
+                        // Dependency overlay popup takes all keys.
+                        if app.dependencies.is_some() {
+                            handle_dependency_popup(app, key.code, tx).await;
+                            continue;
+                        }
                         match key.code {
                         KeyCode::Up => {
                             if let Some(ref mut fb) = app.file_browse {
@@ -129,6 +138,13 @@ async fn run(
                             app.file_browse = None;
                         }
                         KeyCode::Enter => {
+                            let has_deps = app
+                                .file_browse
+                                .as_ref()
+                                .and_then(|fb| fb.files.get(fb.selected))
+                                .map(|f| !f.dependencies.is_empty())
+                                .unwrap_or(false);
+                            let mut did_add = false;
                             if let Some(ref mut fb) = app.file_browse {
                                 if fb.selected < fb.files.len() {
                                     let f = &fb.files[fb.selected];
@@ -189,6 +205,7 @@ async fn run(
                                                 app.project = Some(manifest);
                                                 fb.already_added = true;
                                                 fb.added_index = Some(fb.selected);
+                                                did_add = true;
                                                 let cwd2 = cwd.clone();
                                                 tokio::spawn(async move {
                                                     let cfg = Config::load().unwrap_or_default();
@@ -201,9 +218,18 @@ async fn run(
                                     }
                                 }
                             }
+                            // Auto-open the dependency popup when the added
+                            // file declared dependencies (after the borrows end).
+                            if did_add && has_deps {
+                                let cfg = Config::load().unwrap_or_default();
+                                open_dependency_popup(app, &cfg, tx).await;
+                            }
                         }
                         KeyCode::Char('l') => {
                             open_link_version_popup(app);
+                        }
+                        KeyCode::Char('d') => {
+                            open_dependency_popup(app, &Config::load().unwrap_or_default(), tx).await;
                         }
                         _ => {}
                     }}
@@ -220,6 +246,12 @@ async fn run(
                     if app.mode != AppMode::Search {
                         continue;
                     }
+                    // Refresh lockfile-known ids so lockfile-only deps (and
+                    // any just-added mods) show the in-pack mark.
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let (slugs, cf_ids) = lock::read_known_ids(&cwd);
+                    app.lock_slugs = slugs;
+                    app.lock_cf_ids = cf_ids;
                     if offset == 0 {
                         app.results = results;
                         app.scroll = 0;
@@ -357,6 +389,18 @@ async fn run(
                         lv.status = None;
                     }
                 }
+                AppEvent::DepsLoaded { rows } => {
+                    if let Some(ref mut dep) = app.dependencies {
+                        dep.rows = rows;
+                        dep.scroll = 0;
+                        dep.selected = 0;
+                        dep.status = if dep.rows.is_empty() {
+                            Some("No dependencies declared.".into())
+                        } else {
+                            None
+                        };
+                    }
+                }
             }
         }
     }
@@ -381,6 +425,9 @@ fn render(frame: &mut Frame, app: &App) {
             search::render_file_browse(frame, app);
             if app.link_version.is_some() {
                 search::render_link_version(frame, app);
+            }
+            if app.dependencies.is_some() {
+                search::render_dependency_popup(frame, app);
             }
         }
         AppMode::Search => search::render_search_screen(frame, app),
@@ -741,6 +788,232 @@ fn apply_link_version(
                 }
                 _ => {}
             }
+        }
+        if manifest.save(&cwd).is_ok() {
+            app.project = Some(manifest);
+            let cwd2 = cwd.clone();
+            tokio::spawn(async move {
+                let cfg = Config::load().unwrap_or_default();
+                if let Err(e) = lock::generate(&cwd2, &cfg).await {
+                    eprintln!("lock: {e}");
+                }
+            });
+        }
+    }
+}
+
+/// Open the dependency popup for the currently-selected file in file-browse.
+/// Triggers a fetch of dep titles + versions; the popup renders a loading
+/// state until `AppEvent::DepsLoaded` arrives.
+async fn open_dependency_popup(
+    app: &mut App,
+    _cfg: &Config,
+    tx: &tokio::sync::mpsc::Sender<AppEvent>,
+) {
+    let Some(ref fb) = app.file_browse else {
+        return;
+    };
+    if fb.files.get(fb.selected).is_none() {
+        return;
+    }
+    app.dependencies = Some(DependencyState {
+        rows: Vec::new(),
+        selected: 0,
+        scroll: 0,
+        status: Some(" Loading… ".into()),
+        version_picker: None,
+    });
+    search::start_dependency_fetch(app, _cfg, tx).await;
+}
+
+/// Key handler for the dependency popup. `v` opens a version picker sub-popup,
+/// Space toggles optional deps, `v` opens/commits the version picker,
+/// Enter commits (in picker) or applies all choices and rebuilds the lock.
+async fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+    let in_picker = app.dependencies.as_ref().map(|d| d.version_picker.is_some()).unwrap_or(false);
+    match key {
+        KeyCode::Esc => {
+            if in_picker {
+                if let Some(ref mut dep) = app.dependencies {
+                    dep.version_picker = None;
+                }
+            } else {
+                app.dependencies = None;
+            }
+        }
+        KeyCode::Up => {
+            let Some(ref mut dep) = app.dependencies else { return };
+            if in_picker {
+                if let Some(ref mut vp) = dep.version_picker {
+                    if vp.selected > 0 {
+                        vp.selected -= 1;
+                    }
+                    if vp.selected < vp.scroll {
+                        vp.scroll = vp.selected;
+                    }
+                }
+            } else {
+                if dep.selected > 0 {
+                    dep.selected -= 1;
+                }
+                let vis = 10usize;
+                if dep.selected < dep.scroll {
+                    dep.scroll = dep.selected;
+                } else if dep.selected >= dep.scroll + vis {
+                    dep.scroll = dep.selected.saturating_sub(vis - 1);
+                }
+            }
+        }
+        KeyCode::Down => {
+            let Some(ref mut dep) = app.dependencies else { return };
+            if in_picker {
+                if let Some(ref mut vp) = dep.version_picker {
+                    let count = dep.rows.get(vp.row).map_or(0, |r| r.versions.len() + 1);
+                    if vp.selected < count.saturating_sub(1) {
+                        vp.selected += 1;
+                    }
+                    let vis = 5usize;
+                    if vp.selected >= vp.scroll + vis {
+                        vp.scroll = vp.selected.saturating_sub(vis - 1);
+                    }
+                }
+            } else {
+                let max = dep.rows.len().saturating_sub(1);
+                if dep.selected < max {
+                    dep.selected += 1;
+                }
+                let vis = 10usize;
+                if dep.selected >= dep.scroll + vis {
+                    dep.scroll = dep.selected.saturating_sub(vis - 1);
+                }
+            }
+        }
+        KeyCode::Char('v') => {
+            let Some(ref mut dep) = app.dependencies else { return };
+            if in_picker {
+                // Commit chosen version (index 0 = default).
+                let pick = dep.version_picker.clone();
+                if let Some(vp) = pick {
+                    let row = &mut dep.rows[vp.row];
+                    row.version = if vp.selected == 0 {
+                        None
+                    } else {
+                        row.versions.get(vp.selected - 1).map(|f| f.name.clone())
+                    };
+                    dep.version_picker = None;
+                }
+            } else {
+                let sel = dep.selected;
+                if let Some(row) = dep.rows.get(sel) {
+                    if !row.versions.is_empty() {
+                        // Pre-select the row's current version (default = 0).
+                        let selected = row
+                            .version
+                            .as_ref()
+                            .and_then(|v| row.versions.iter().position(|f| f.name == *v))
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
+                        dep.version_picker = Some(DepVersionPicker {
+                            row: sel,
+                            selected,
+                            scroll: selected.saturating_sub(4),
+                        });
+                    }
+                }
+            }
+        }
+        // Enter on a dependency opens its version list (like a normal mod's
+        // file browse); Enter inside the list picks the highlighted version.
+        KeyCode::Enter => {
+            let Some(ref mut dep) = app.dependencies else { return };
+            if in_picker {
+                // Commit chosen version (index 0 = default).
+                let pick = dep.version_picker.clone();
+                if let Some(vp) = pick {
+                    let row = &mut dep.rows[vp.row];
+                    row.version = if vp.selected == 0 {
+                        None
+                    } else {
+                        row.versions.get(vp.selected - 1).map(|f| f.name.clone())
+                    };
+                    dep.version_picker = None;
+                }
+            } else if let Some(row) = dep.rows.get(dep.selected) {
+                if !row.versions.is_empty() {
+                    let selected = row
+                        .version
+                        .as_ref()
+                        .and_then(|v| row.versions.iter().position(|f| f.name == *v))
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    dep.version_picker = Some(DepVersionPicker {
+                        row: dep.selected,
+                        selected,
+                        scroll: selected.saturating_sub(4),
+                    });
+                }
+            }
+        }
+        KeyCode::Char(' ') => {
+            let Some(ref mut dep) = app.dependencies else { return };
+            if !in_picker {
+                if let Some(row) = dep.rows.get_mut(dep.selected) {
+                    if row.optional {
+                        row.enabled = !row.enabled;
+                    }
+                }
+            }
+        }
+        KeyCode::Char('a') => {
+            if !in_picker {
+                apply_dependencies(app);
+                app.dependencies = None;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Write the player's dependency choices into the manifest: deps the player
+/// pinned to a specific version (or enabled optional deps) become plain mod
+/// entries — that's the ONLY way a dep version choice persists. Deps left at
+/// default are not written; lockfile generation resolves them to the highest
+/// matching version. Then rebuild the lock (purely TOML-derived).
+fn apply_dependencies(app: &mut App) {
+    let Some(ref dep_state) = app.dependencies else { return };
+    let Some(ref fb) = app.file_browse else { return };
+    let cat = fb.project_type.clone();
+
+    // Rows to persist: any dep the player pinned a version for, plus enabled
+    // optional deps (which need a manifest entry to be included at all).
+    // Picking a version always writes — even for optional deps that weren't
+    // explicitly toggled — so the choice survives.
+    let mut to_add: Vec<(String, project::ModSpec)> = Vec::new();
+    for row in &dep_state.rows {
+        let pinned = row.version.is_some();
+        if pinned || (row.enabled && row.optional) {
+            let spec = match &row.version {
+                Some(v) => project::ModSpec::Simple(v.clone()),
+                // Enabled optional at default version: no version pin, so the
+                // lock resolves the highest matching. Keyed by the slug, which
+                // the lock treats as the modrinth slug.
+                None => project::ModSpec::Detailed(project::DetailedSpec {
+                    version: None,
+                    modrinth: Some(project::ModrinthSpec {
+                        slug: Some(row.id.clone()),
+                        version: None,
+                    }),
+                    curseforge: None,
+                }),
+            };
+            to_add.push((row.id.clone(), spec));
+        }
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if let Ok(mut manifest) = project::Manifest::load(&cwd) {
+        for (dep_id, spec) in to_add {
+            manifest.cat_mut(&cat).insert(dep_id, spec);
         }
         if manifest.save(&cwd).is_ok() {
             app.project = Some(manifest);

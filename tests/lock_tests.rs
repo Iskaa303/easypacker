@@ -17,6 +17,7 @@ fn sample_lock() -> Lock {
                 url: Some("https://cdn.modrinth.com/data/x/sodium.jar".into()),
                 size: 1,
                 hashes: LockHashes::new(Some("aaa".into()), Some("bbb".into()), None),
+                dependencies: vec![LockDep { id: "citadel".into(), optional: false }],
             }),
             curseforge: Some(LockCurseForge {
                 project_id: 394_468,
@@ -25,6 +26,7 @@ fn sample_lock() -> Lock {
                 url: Some("https://edge.forgecdn.net/files/sodium.jar".into()),
                 size: 2,
                 hashes: LockHashes::new(Some("ccc".into()), None, Some("ddd".into())),
+                dependencies: vec![],
             }),
         }],
         resourcepack: vec![],
@@ -63,6 +65,9 @@ fn lock_renders_in_user_shape() {
     assert_eq!(m["modrinth"]["hashes"]["sha512"].as_str(), Some("bbb"));
     assert_eq!(m["curseforge"]["file_id"].as_integer(), Some(12_345));
     assert_eq!(m["curseforge"]["hashes"]["md5"].as_str(), Some("ddd"));
+    // Dependency edge (cargo-style id list, multi-line like Cargo.lock).
+    assert!(out.contains("dependencies = [\n    \"citadel\",\n]"), "not multiline:\n{out}");
+    assert_eq!(m["dependencies"].as_array().unwrap(), &[toml::Value::String("citadel".into())]);
 }
 
 #[test]
@@ -76,4 +81,61 @@ fn render_omits_missing_url_and_hashes() {
     assert!(!mr_block.contains("url"));
     assert!(!mr_block.contains("hashes"));
     toml::from_str::<toml::Value>(&out).unwrap();
+}
+
+#[test]
+fn rewrite_edges_keeps_required_only_and_rewrites_to_slugs() {
+    let mut entry = LockEntry {
+        id: "tfc".into(),
+        name: "TFC".into(),
+        version: "4.2.7".into(),
+        modrinth: Some(LockModrinth {
+            slug: "terrafirmacraft".into(),
+            project_id: "JaCEZUhg".into(),
+            version_id: "eBIfZlEM".into(),
+            filename: "tfc.jar".into(),
+            url: None,
+            size: 1,
+            hashes: None,
+            dependencies: vec![
+                LockDep { id: "nU0bVIaL".into(), optional: false }, // patchouli, required
+                LockDep { id: "someopt".into(), optional: true },    // optional -> dropped
+            ],
+        }),
+        curseforge: None,
+
+    };
+    let slug_of = std::collections::HashMap::from([
+        ((Platform::Modrinth, "nU0bVIaL".to_string()), "patchouli".to_string()),
+    ]);
+    let known = std::collections::HashSet::from(["patchouli".to_string()]);
+    rewrite_edges(&mut entry, &slug_of, &known);
+    let deps = &entry.modrinth.as_ref().unwrap().dependencies;
+    // Only the required dep remains, rewritten to its slug.
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].id, "patchouli");
+    assert!(!deps[0].optional);
+}
+
+#[test]
+fn rewrite_edges_drops_unknown_deps() {
+    let mut entry = LockEntry {
+        id: "tfc".into(),
+        name: "TFC".into(),
+        version: "4.2.7".into(),
+        modrinth: Some(LockModrinth {
+            slug: "terrafirmacraft".into(),
+            project_id: "JaCEZUhg".into(),
+            version_id: "eBIfZlEM".into(),
+            filename: "tfc.jar".into(),
+            url: None,
+            size: 1,
+            hashes: None,
+            dependencies: vec![LockDep { id: "unknown".into(), optional: false }],
+        }),
+        curseforge: None,
+
+    };
+    rewrite_edges(&mut entry, &std::collections::HashMap::new(), &std::collections::HashSet::new());
+    assert!(entry.modrinth.as_ref().unwrap().dependencies.is_empty());
 }
