@@ -196,3 +196,79 @@ sodium = "Sodium 0.8.12"
     let out = m.render();
     assert!(!out.contains("dependencies"));
 }
+
+#[test]
+fn same_file_matches_by_hash_not_name() {
+    use crate::api::types::ProjectFile;
+    let base = || ProjectFile {
+        name: String::new(),
+        mc_versions: vec![],
+        loaders: vec![],
+        date_published: String::new(),
+        downloads: 0,
+        size: 0,
+        url: None,
+        platforms: vec![],
+        modrinth_version_id: None,
+        modrinth_url: None,
+        curseforge_file_id: None,
+        curseforge_url: None,
+        curseforge_project_id: None,
+        sha1: None,
+        modrinth_name: None,
+        curseforge_name: None,
+        dependencies: vec![],
+    };
+    // Different names, same sha1 -> same file.
+    let mut a = base();
+    a.name = "Mod-1.0-mc1.21.1.jar".into();
+    a.sha1 = Some("abc123".into());
+    a.size = 100;
+    let mut b = base();
+    b.name = "completely-different-name.zip".into();
+    b.sha1 = Some("ABC123".into());
+    b.size = 9999;
+    assert!(a.same_file_as(&b), "sha1 match should win over name/size");
+    // Same name+size but different sha1 -> NOT the same file.
+    let mut c = base();
+    c.name = "Mod-1.0-mc1.21.1.jar".into();
+    c.sha1 = Some("def456".into());
+    c.size = 100;
+    assert!(!a.same_file_as(&c), "different sha1 should not match");
+    // No sha1 on one side -> fall back to size+name.
+    let mut d = base();
+    d.name = "Mod-1.0-mc1.21.1.jar".into();
+    d.sha1 = None;
+    d.size = 100;
+    assert!(a.same_file_as(&d), "no hash -> size+name fallback");
+}
+
+#[test]
+fn renders_per_platform_versions() {
+    // A dep pinned with different names on each platform keeps both names in
+    // the toml: modrinth = { slug, version } + curseforge = { projectId, version }.
+    let m: Manifest = toml::from_str(
+        r#"
+[project]
+name = "x"
+minecraft = "1.21.1"
+loader = "neoforge"
+
+[mods]
+patchouli = { modrinth = { slug = "patchouli", version = "1.21.1-92-neoforge" }, curseforge = { projectId = 306770, version = "Patchouli-1.21.1-92-NEOFORGE.jar" } }
+"#,
+    )
+    .unwrap();
+    let out = m.render();
+    assert!(out.contains(
+        "patchouli = { modrinth = { slug = \"patchouli\", version = \"1.21.1-92-neoforge\" }, curseforge = { projectId = 306770, version = \"Patchouli-1.21.1-92-NEOFORGE.jar\" } }"
+    ), "per-platform versions not rendered:\n{out}");
+    // Round-trips and each platform resolves its own version.
+    let m2: Manifest = toml::from_str(&out).unwrap();
+    let spec = &m2.mods["patchouli"];
+    assert_eq!(spec.version_for(true).as_deref(), Some("1.21.1-92-neoforge"));
+    assert_eq!(
+        spec.version_for(false).as_deref(),
+        Some("Patchouli-1.21.1-92-NEOFORGE.jar")
+    );
+}

@@ -1,6 +1,7 @@
 use crate::api::filters;
 use crate::api::{
-    CurseForgeClient, ModrinthClient, Platform, ProjectFile, SearchFilters, SearchResult,
+    CurseForgeClient, CurseForgeFileInfo, ModrinthClient, Platform, ProjectFile, SearchFilters,
+    SearchResult,
 };
 use crate::app::App;
 use crate::config::Config;
@@ -451,7 +452,7 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                 Ok(files) => {
                     for mv in files {
                         let pf = ProjectFile {
-                            name: mv.name,
+                            name: mv.name.clone(),
                             mc_versions: mv.game_versions,
                             loaders: mv.loaders,
                             date_published: mv.date_published,
@@ -463,12 +464,16 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                             modrinth_url: mv.url,
                             curseforge_file_id: None,
                             curseforge_url: None,
+                            curseforge_project_id: None,
+                            sha1: mv.sha1.clone(),
+                            modrinth_name: Some(mv.name.clone()),
+                            curseforge_name: None,
                             dependencies: mv.dependencies,
                         };
-                        let lower = pf.name.to_lowercase();
+                        // Merge modrinth files into each other by name.
                         if let Some(existing) = all_files
                             .iter_mut()
-                            .find(|e: &&mut ProjectFile| e.name.to_lowercase() == lower)
+                            .find(|e: &&mut ProjectFile| e.same_file_as(&pf))
                         {
                             if !existing.platforms.contains(&Platform::Modrinth) {
                                 existing.platforms.push(Platform::Modrinth);
@@ -479,6 +484,9 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                             if pf.modrinth_version_id.is_some() {
                                 existing.modrinth_version_id = pf.modrinth_version_id.clone();
                                 existing.modrinth_url = pf.modrinth_url.clone();
+                            }
+                            if pf.modrinth_name.is_some() {
+                                existing.modrinth_name = pf.modrinth_name.clone();
                             }
                             if pf.url.is_some() {
                                 existing.url = pf.url.clone();
@@ -513,7 +521,7 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                                 .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
                                 .collect();
                             let pf = ProjectFile {
-                                name: cf.display_name,
+                                name: cf.display_name.clone(),
                                 mc_versions,
                                 loaders,
                                 date_published: cf.file_date,
@@ -525,12 +533,17 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                                 modrinth_url: None,
                                 curseforge_file_id: Some(cf.id),
                                 curseforge_url: cf.download_url,
+                                curseforge_project_id: Some(i64::from(cf.id)),
+                                sha1: cf.sha1.clone(),
+                                modrinth_name: None,
+                                curseforge_name: Some(cf.display_name.clone()),
                                 dependencies: cf.dependencies,
                             };
-                            let lower = pf.name.to_lowercase();
+                            // Merge across platforms by hash (or size+name when
+                            // sha1 is missing on one side).
                             if let Some(existing) = all_files
                                 .iter_mut()
-                                .find(|e: &&mut ProjectFile| e.name.to_lowercase() == lower)
+                                .find(|e: &&mut ProjectFile| e.same_file_as(&pf))
                             {
                                 if !existing.platforms.contains(&Platform::CurseForge) {
                                     existing.platforms.push(Platform::CurseForge);
@@ -541,6 +554,9 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                                 if pf.curseforge_file_id.is_some() {
                                     existing.curseforge_file_id = pf.curseforge_file_id;
                                     existing.curseforge_url = pf.curseforge_url.clone();
+                                }
+                                if pf.curseforge_name.is_some() {
+                                    existing.curseforge_name = pf.curseforge_name.clone();
                                 }
                                 if pf.url.is_some() {
                                     existing.url = pf.url.clone();
@@ -1223,7 +1239,7 @@ pub(crate) fn render_link_version(frame: &mut Frame, app: &App) {
     let hint = if lv.picked.is_none() {
         " Enter:search  ↑↓:select  Enter(on result):open versions  Esc:back "
     } else {
-        " Enter:link version  ↑↓:select  Backspace:back to search  Esc:cancel (⚠ = size differs) "
+        " Enter:link version  ↑↓:select  Backspace:back to search  Esc:cancel (⚠ = hash mismatch) "
     };
     let status = lv.status.as_deref().unwrap_or(hint);
     let st_style = if lv.status.is_some() {
@@ -1310,9 +1326,9 @@ fn render_link_files(frame: &mut Frame, area: Rect, fb: &FileBrowseState, lv: &L
             spans.push(Span::styled(format!("  {date}"), bg.fg(Color::DarkGray)));
             spans.push(Span::styled(format!("  {}↓", f.downloads), bg.fg(Color::Green)));
             if let Some(a) = added_file
-                && a.size != f.size
+                && !a.same_file_as(f)
             {
-                spans.push(Span::styled(format!("  ⚠ {}B", f.size), bg.fg(Color::Red)));
+                spans.push(Span::styled("  ⚠ hash mismatch", bg.fg(Color::Red)));
             }
             Line::from(spans)
         })
@@ -1419,7 +1435,7 @@ pub(crate) async fn start_link_file_fetch(
             if let Ok(versions) = ModrinthClient::get_versions(slug, None, None).await {
                 for mv in versions {
                     files.push(ProjectFile {
-                        name: mv.name,
+                        name: mv.name.clone(),
                         mc_versions: mv.game_versions,
                         loaders: mv.loaders,
                         date_published: mv.date_published,
@@ -1431,6 +1447,10 @@ pub(crate) async fn start_link_file_fetch(
                         modrinth_url: mv.url,
                         curseforge_file_id: None,
                         curseforge_url: None,
+                        curseforge_project_id: None,
+                        sha1: mv.sha1.clone(),
+                        modrinth_name: Some(mv.name.clone()),
+                        curseforge_name: None,
                         dependencies: mv.dependencies,
                     });
                 }
@@ -1456,7 +1476,7 @@ pub(crate) async fn start_link_file_fetch(
                         .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
                         .collect();
                     files.push(ProjectFile {
-                        name: cf.display_name,
+                        name: cf.display_name.clone(),
                         mc_versions,
                         loaders,
                         date_published: cf.file_date,
@@ -1468,6 +1488,10 @@ pub(crate) async fn start_link_file_fetch(
                         modrinth_url: None,
                         curseforge_file_id: Some(cf.id),
                         curseforge_url: cf.download_url,
+                        curseforge_project_id: Some(i64::from(cf.id)),
+                        sha1: cf.sha1.clone(),
+                        modrinth_name: None,
+                        curseforge_name: Some(cf.display_name.clone()),
                         dependencies: cf.dependencies,
                     });
                 }
@@ -1548,39 +1572,67 @@ pub(crate) async fn start_dependency_fetch(
     } else {
         String::new()
     };
+    let want_cf = app
+        .project
+        .as_ref()
+        .map(|p| p.project.platforms.iter().any(|t| t.eq_ignore_ascii_case("curseforge")))
+        .unwrap_or(false);
     let api_key = cfg.get_api_key(None).ok();
     let tx = tx.clone();
     tokio::spawn(async move {
         let mut rows: Vec<DepRow> = Vec::new();
         for d in deps {
-            let versions: Vec<ProjectFile> = match d.platform {
+            // Fetch the declaring platform's versions, then cross-fetch the
+            // counterpart platform and merge by sha1 so a dep whose names
+            // differ between platforms shows one row per release.
+            let mut versions: Vec<ProjectFile> = Vec::new();
+            let mut resolved_id = d.project_id.clone();
+            let mut title = d.project_id.clone();
+            match d.platform {
                 Platform::Modrinth => {
-                    match ModrinthClient::get_versions(
+                    if let Ok(p) = ModrinthClient::get_project(&d.project_id).await {
+                        resolved_id = p.slug.clone();
+                        title = p.title;
+                    }
+                    if let Ok(vs) = ModrinthClient::get_versions(
                         &d.project_id,
                         if mc.is_empty() { None } else { Some(&mc) },
                         if loader.is_empty() { None } else { Some(&loader) },
                     )
                     .await
                     {
-                        Ok(vs) => vs
-                            .into_iter()
-                            .map(|v| ProjectFile {
-                                name: v.name,
-                                mc_versions: v.game_versions,
-                                loaders: v.loaders,
-                                date_published: v.date_published,
-                                downloads: v.downloads,
-                                size: v.size,
-                                url: v.url.clone(),
-                                platforms: vec![Platform::Modrinth],
-                                modrinth_version_id: Some(v.id),
-                                modrinth_url: v.url,
-                                curseforge_file_id: None,
-                                curseforge_url: None,
-                                dependencies: Vec::new(),
-                            })
-                            .collect(),
-                        Err(_) => Vec::new(),
+                        versions.extend(vs.into_iter().map(|v| ProjectFile {
+                            name: v.name.clone(),
+                            mc_versions: v.game_versions,
+                            loaders: v.loaders,
+                            date_published: v.date_published,
+                            downloads: v.downloads,
+                            size: v.size,
+                            url: v.url.clone(),
+                            platforms: vec![Platform::Modrinth],
+                            modrinth_version_id: Some(v.id),
+                            modrinth_url: v.url,
+                            curseforge_file_id: None,
+                            curseforge_url: None,
+                            curseforge_project_id: None,
+                            sha1: v.sha1.clone(),
+                            modrinth_name: Some(v.name.clone()),
+                            curseforge_name: None,
+                            dependencies: Vec::new(),
+                        }));
+                    }
+                    // Counterpart: curseforge, via the resolved slug.
+                    if want_cf
+                        && let Some(ref key) = api_key
+                    {
+                        let client = CurseForgeClient::new(key);
+                        if let Ok(Some((mod_id, _))) =
+                            client.find_by_slug(&resolved_id, Some(6)).await
+                        {
+                            if let Ok(fs) = client.get_files(mod_id, None, None).await {
+                                merge_cf_files(&mut versions, fs, &mc, Some(i64::from(mod_id)));
+                            }
+                        }
                     }
                 }
                 Platform::CurseForge => {
@@ -1591,70 +1643,50 @@ pub(crate) async fn start_dependency_fetch(
                         continue;
                     };
                     let client = CurseForgeClient::new(key);
-                    match client.get_files(mod_id, None, None).await {
-                        Ok(fs) => fs
-                            .into_iter()
-                            .filter(|f| version_matches(f.game_versions.as_slice(), &mc))
-                            .map(|f| {
-                                let known: Vec<&str> = filters::LOADERS.to_vec();
-                                let loaders: Vec<String> = f
-                                    .game_versions
-                                    .iter()
-                                    .filter(|v| known.iter().any(|l| v.eq_ignore_ascii_case(l)))
-                                    .map(|v| v.to_lowercase())
-                                    .collect();
-                                let mc_versions: Vec<String> = f
-                                    .game_versions
-                                    .iter()
-                                    .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
-                                    .cloned()
-                                    .collect();
-                                ProjectFile {
-                                    name: f.display_name,
-                                    mc_versions,
-                                    loaders,
-                                    date_published: f.file_date,
-                                    downloads: f.download_count,
-                                    size: f.file_length,
-                                    url: f.download_url.clone(),
-                                    platforms: vec![Platform::CurseForge],
-                                    modrinth_version_id: None,
-                                    modrinth_url: None,
-                                    curseforge_file_id: Some(f.id),
-                                    curseforge_url: f.download_url,
+                    if let Ok((_, name, slug)) = client.get_mod(mod_id).await {
+                        resolved_id = slug.clone();
+                        title = name;
+                    }
+                    if let Ok(fs) = client.get_files(mod_id, None, None).await {
+                        merge_cf_files(&mut versions, fs, &mc, Some(i64::from(mod_id)));
+                    }
+                    // Counterpart: modrinth, via the resolved slug.
+                    if ModrinthClient::get_project(&resolved_id).await.is_ok() {
+                        if let Ok(vs) = ModrinthClient::get_versions(
+                            &resolved_id,
+                            if mc.is_empty() { None } else { Some(&mc) },
+                            if loader.is_empty() { None } else { Some(&loader) },
+                        )
+                        .await
+                        {
+                            for v in vs {
+                                let pf = ProjectFile {
+                                    name: v.name.clone(),
+                                    mc_versions: v.game_versions,
+                                    loaders: v.loaders,
+                                    date_published: v.date_published,
+                                    downloads: v.downloads,
+                                    size: v.size,
+                                    url: v.url.clone(),
+                                    platforms: vec![Platform::Modrinth],
+                                    modrinth_version_id: Some(v.id),
+                                    modrinth_url: v.url,
+                                    curseforge_file_id: None,
+                                    curseforge_url: None,
+                                    curseforge_project_id: None,
+                                    sha1: v.sha1.clone(),
+                                    modrinth_name: Some(v.name.clone()),
+                                    curseforge_name: None,
                                     dependencies: Vec::new(),
-                                }
-                            })
-                            .collect(),
-                        Err(_) => Vec::new(),
-                    }
-                }
-            };
-            // Resolve the easypacker id (modrinth slug / cf slug) + display
-            // title in one call; fall back to the raw project id.
-            let (id, title) = match d.platform {
-                Platform::Modrinth => {
-                    match ModrinthClient::get_project(&d.project_id).await {
-                        Ok(p) => (p.slug, p.title),
-                        Err(_) => (d.project_id.clone(), d.project_id.clone()),
-                    }
-                }
-                Platform::CurseForge => match api_key.as_ref() {
-                    Some(key) => {
-                        if let Ok(mod_id) = d.project_id.parse::<i32>() {
-                            match CurseForgeClient::new(key).get_mod(mod_id).await {
-                                Ok((_, name, slug)) => (slug, name),
-                                Err(_) => (d.project_id.clone(), d.project_id.clone()),
+                                };
+                                merge_project_file(&mut versions, pf);
                             }
-                        } else {
-                            (d.project_id.clone(), d.project_id.clone())
                         }
                     }
-                    None => (d.project_id.clone(), d.project_id.clone()),
-                },
-            };
+                }
+            }
             rows.push(DepRow {
-                id,
+                id: resolved_id,
                 project_id: d.project_id.clone(),
                 platform: d.platform.clone(),
                 title,
@@ -1662,6 +1694,7 @@ pub(crate) async fn start_dependency_fetch(
                 enabled: d.kind != DepKind::Optional,
                 version: None,
                 versions,
+                changed: false,
             });
         }
         // Pre-select the version pinned in the manifest (from a previous
@@ -1673,12 +1706,15 @@ pub(crate) async fn start_dependency_fetch(
         for row in rows.iter_mut() {
             let spec = manifest.as_ref().and_then(|m| m.cat("mod").get(&row.id));
             // A dep present in the manifest was previously enabled/pinned:
-            // reflect that state (pinned version + enabled optional).
+            // reflect that state. Match by either platform's own version name.
             if let Some(spec) = spec {
-                if let Some(pin) = spec.shared_version() {
-                    if row.versions.iter().any(|v| v.name == pin) {
-                        row.version = Some(pin);
-                    }
+                let mr_pin = spec.version_for(true);
+                let cf_pin = spec.version_for(false);
+                if let Some(pf) = row.versions.iter().find(|f| {
+                    f.modrinth_name.as_deref().is_some_and(|n| Some(n) == mr_pin.as_deref())
+                        || f.curseforge_name.as_deref().is_some_and(|n| Some(n) == cf_pin.as_deref())
+                }) {
+                    row.version = Some(pf.name.clone());
                 }
                 if row.optional {
                     row.enabled = true;
@@ -1691,6 +1727,108 @@ pub(crate) async fn start_dependency_fetch(
 
 fn version_matches(versions: &[String], want: &str) -> bool {
     want.is_empty() || versions.iter().any(|v| v == want)
+}
+
+/// CurseForge display names are often the raw archive filename (e.g.
+/// "iceandfire-2.1-beta.1.jar") rather than a real version name. When that's
+/// the case, prefer the modrinth version name — they're the same file (same
+/// sha1), so the modrinth name is the readable version.
+pub(crate) fn readable_cf_name(cf_name: &str, mr_name: Option<&str>) -> String {
+    let lower = cf_name.to_lowercase();
+    let is_filename = [".jar", ".zip", ".rar", ".7z", ".litemod", ".mcpack"]
+        .iter()
+        .any(|ext| lower.ends_with(ext));
+    if is_filename {
+        mr_name.unwrap_or(cf_name).to_string()
+    } else {
+        cf_name.to_string()
+    }
+}
+
+/// Merge curseforge file infos into a project-file list, hash-matching
+/// existing entries so differently-named releases on modrinth/curseforge
+/// become one row.
+fn merge_cf_files(
+    versions: &mut Vec<ProjectFile>,
+    fs: Vec<CurseForgeFileInfo>,
+    mc: &str,
+    project_id: Option<i64>,
+) {
+    for f in fs {
+        let known: Vec<&str> = filters::LOADERS.to_vec();
+        let loaders: Vec<String> = f
+            .game_versions
+            .iter()
+            .filter(|v| known.iter().any(|l| v.eq_ignore_ascii_case(l)))
+            .map(|v| v.to_lowercase())
+            .collect();
+        let mc_versions: Vec<String> = f
+            .game_versions
+            .iter()
+            .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
+            .cloned()
+            .collect();
+        if !version_matches(&mc_versions, mc) {
+            continue;
+        }
+        let pf = ProjectFile {
+            name: f.display_name.clone(),
+            mc_versions,
+            loaders,
+            date_published: f.file_date,
+            downloads: f.download_count,
+            size: f.file_length,
+            url: f.download_url.clone(),
+            platforms: vec![Platform::CurseForge],
+            modrinth_version_id: None,
+            modrinth_url: None,
+            curseforge_file_id: Some(f.id),
+            curseforge_url: f.download_url,
+            curseforge_project_id: project_id,
+            sha1: f.sha1.clone(),
+            modrinth_name: None,
+            curseforge_name: Some(f.display_name.clone()),
+            dependencies: Vec::new(),
+        };
+        merge_project_file(versions, pf);
+    }
+}
+
+/// Insert `pf` into `versions`, merging into the hash-matching entry if one
+/// exists (keeping the first-seen name, adding the other platform's ids).
+fn merge_project_file(versions: &mut Vec<ProjectFile>, pf: ProjectFile) {
+    if let Some(existing) = versions.iter_mut().find(|e| e.same_file_as(&pf)) {
+        for p in &pf.platforms {
+            if !existing.platforms.contains(p) {
+                existing.platforms.push(p.clone());
+            }
+        }
+        if pf.modrinth_version_id.is_some() {
+            existing.modrinth_version_id = pf.modrinth_version_id.clone();
+            existing.modrinth_url = pf.modrinth_url.clone();
+        }
+        if pf.curseforge_file_id.is_some() {
+            existing.curseforge_file_id = pf.curseforge_file_id;
+            existing.curseforge_url = pf.curseforge_url.clone();
+        }
+        if pf.url.is_some() {
+            existing.url = pf.url.clone();
+        }
+        if pf.sha1.is_some() && existing.sha1.is_none() {
+            existing.sha1 = pf.sha1.clone();
+        }
+        if pf.modrinth_name.is_some() && existing.modrinth_name.is_none() {
+            existing.modrinth_name = pf.modrinth_name.clone();
+        }
+        if pf.curseforge_name.is_some() && existing.curseforge_name.is_none() {
+            existing.curseforge_name = pf.curseforge_name.clone();
+        }
+        if pf.curseforge_project_id.is_some() && existing.curseforge_project_id.is_none() {
+            existing.curseforge_project_id = pf.curseforge_project_id;
+        }
+    } else {
+        versions.push(pf);
+    }
 }
 
 /// Full-screen overlay popup listing required + optional dependencies.

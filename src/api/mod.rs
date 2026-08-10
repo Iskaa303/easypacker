@@ -8,7 +8,9 @@ use crate::config::Config;
 use color_eyre::eyre::Result;
 
 pub use curseforge::CurseForgeClient;
+pub use curseforge::CurseForgeFileInfo;
 pub use modrinth::ModrinthClient;
+pub use modrinth::ModrinthVersionInfo;
 pub use types::{Platform, ProjectFile, SearchFilters, SearchResult};
 
 pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {

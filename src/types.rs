@@ -95,6 +95,10 @@ pub(crate) struct DepRow {
     pub version: Option<String>,
     /// Available versions, rendered like a normal file-browse list.
     pub versions: Vec<ProjectFile>,
+    /// True once the player actively picked a version or toggled this dep in
+    /// the current popup session. Only changed rows are ever written to the
+    /// manifest — opening the menu never overwrites existing pins.
+    pub changed: bool,
 }
 
 /// Dependency popup: lists required + optional deps for the browsed mod,

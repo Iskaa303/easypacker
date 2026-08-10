@@ -2,7 +2,7 @@
 //! Modrinth/CurseForge and pins exact files, download urls and hashes.
 //! Regenerated on every run; never edit by hand (cargo-style).
 
-use crate::api::{CurseForgeClient, ModrinthClient};
+use crate::api::{CurseForgeClient, CurseForgeFileInfo, ModrinthClient, ModrinthVersionInfo};
 use crate::api::types::{DepKind, Platform};
 use crate::config::Config;
 use crate::project::{CATEGORIES, Manifest, ModSpec, tstr};
@@ -37,6 +37,8 @@ struct LockModrinth {
     slug: String,
     project_id: String,
     version_id: String,
+    /// Modrinth's own version name (may differ from curseforge's).
+    version: String,
     filename: String,
     url: Option<String>,
     size: u64,
@@ -48,6 +50,8 @@ struct LockModrinth {
 struct LockCurseForge {
     project_id: i64,
     file_id: i64,
+    /// CurseForge's own version name (may differ from modrinth's).
+    version: String,
     filename: String,
     url: Option<String>,
     size: u64,
@@ -78,6 +82,44 @@ impl LockHashes {
             Some(Self { sha1, sha512, md5 })
         }
     }
+}
+
+/// Find the counterpart file whose sha1 matches `want` (names differ between
+/// modrinth and curseforge). Falls back to the first (latest) file when the
+/// wanted side has no sha1 or no file matches — e.g. the wanted version
+/// doesn't exist on the counterpart platform.
+fn cf_file_matching<'a>(files: &'a [CurseForgeFileInfo], want: Option<&str>) -> Option<&'a CurseForgeFileInfo> {
+    match want {
+        Some(w) => files.iter().find(|f| {
+            f.sha1.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(w))
+        }),
+        None => files.first(),
+    }
+}
+
+fn mr_version_matching<'a>(
+    versions: &'a [ModrinthVersionInfo],
+    want: Option<&str>,
+) -> Option<&'a ModrinthVersionInfo> {
+    match want {
+        Some(w) => versions.iter().find(|v| {
+            v.sha1.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(w))
+        }),
+        None => versions.first(),
+    }
+}
+
+/// CurseForge download URL. The API sometimes returns `download_url` as null,
+/// but the CDN path is deterministic from the file id and name.
+fn cf_download_url(f: &CurseForgeFileInfo) -> Option<String> {
+    f.download_url.clone().or_else(|| {
+        Some(format!(
+            "https://edge.forgecdn.net/files/{}/{}/{}",
+            f.id / 1000,
+            f.id % 1000,
+            f.file_name
+        ))
+    })
 }
 
 pub struct Report {
@@ -310,14 +352,18 @@ async fn resolve_entry(
     let mut version_name: Option<String> = spec.shared_version();
     let mut mr_lock = None;
     let mut cf_lock = None;
+    // Stash by-name resolution errors; only surface them if the hash
+    // cross-lookup can't recover the counterpart platform.
+    let mut mr_err: Option<String> = None;
+    let mut cf_err: Option<String> = None;
 
-    // Only query platforms the spec actually targets.
+    // Only query platforms the spec explicitly targets by name.
     let has_mr = spec.has_modrinth();
     let has_cf = spec.has_curseforge();
-    let want_mr = want_mr && has_mr;
-    let want_cf = want_cf && has_cf;
+    let resolve_mr = want_mr && has_mr;
+    let resolve_cf = want_cf && has_cf;
 
-    if want_mr {
+    if resolve_mr {
         match resolve_modrinth(id, spec, mc, loader, is_mod).await {
             Ok((title, vname, l)) => {
                 name = Some(title);
@@ -326,10 +372,10 @@ async fn resolve_entry(
                 }
                 mr_lock = Some(l);
             }
-            Err(e) => warnings.push(e),
+            Err(e) => mr_err = Some(e),
         }
     }
-    if want_cf
+    if resolve_cf
         && let Some(ref client) = cf
     {
         match resolve_curseforge(client, class_id, id, spec, mc, loader, is_mod).await {
@@ -342,13 +388,63 @@ async fn resolve_entry(
                 }
                 cf_lock = Some(l);
             }
-            Err(e) => warnings.push(e),
+            Err(e) => cf_err = Some(e),
         }
     }
 
-    // Cross-platform: a spec that only declares one platform (e.g. a dep
-    // written by the dependency popup) still tries to attach the counterpart
-    // platform's file, like any normal mod resolved through the file browse.
+    // Cross-platform: whenever the pack targets a platform but its side is
+    // still missing, try to attach the counterpart by matching the resolved
+    // file's sha1 (names differ between modrinth and curseforge).
+    if want_cf
+        && cf_lock.is_none()
+        && let Some(ref l) = mr_lock
+        && let Some(ref client) = cf
+    {
+        match client
+            .find_by_slug(&l.slug, Some(class_id))
+            .await
+        {
+            Ok(Some((mod_id, _))) => {
+                match client
+                    .get_files(
+                        mod_id,
+                        if mc.is_empty() { None } else { Some(mc) },
+                        if is_mod && !loader.is_empty() { Some(loader) } else { None },
+                    )
+                    .await
+                {
+                    Ok(files) => {
+                        let want = l.hashes.as_ref().and_then(|h| h.sha1.as_deref());
+                        if let Some(f) = cf_file_matching(&files, want) {
+                            cf_lock = Some(LockCurseForge {
+                                project_id: i64::from(mod_id),
+                                file_id: i64::from(f.id),
+                                version: f.display_name.clone(),
+                                filename: f.file_name.clone(),
+                                url: cf_download_url(f),
+                                size: f.file_length,
+                                hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
+                                dependencies: f
+                                    .dependencies
+                                    .iter()
+                                    .filter(|d| {
+                                        d.kind == DepKind::Required || d.kind == DepKind::Optional
+                                    })
+                                    .map(|d| LockDep {
+                                        id: d.project_id.clone(),
+                                        optional: d.kind == DepKind::Optional,
+                                    })
+                                    .collect(),
+                                slug: l.slug.clone(),
+                            });
+                        }
+                    }
+                    Err(e) => warnings.push(format!("curseforge cross: {e}")),
+                }
+            }
+            _ => {}
+        }
+    }
     if want_mr
         && mr_lock.is_none()
         && let Some(ref l) = cf_lock
@@ -363,11 +459,13 @@ async fn resolve_entry(
                 .await
                 {
                     Ok(versions) => {
-                        if let Some(v) = versions.first() {
+                        let want = l.hashes.as_ref().and_then(|h| h.sha1.as_deref());
+                        if let Some(v) = mr_version_matching(&versions, want) {
                             mr_lock = Some(LockModrinth {
                                 slug: project.slug.clone(),
                                 project_id: project.id,
                                 version_id: v.id.clone(),
+                                version: v.name.clone(),
                                 filename: v.filename.clone(),
                                 url: v.url.clone(),
                                 size: v.size,
@@ -398,53 +496,14 @@ async fn resolve_entry(
             Err(_) => {}
         }
     }
-    if want_cf
-        && cf_lock.is_none()
-        && let Some(ref l) = mr_lock
-        && let Some(ref client) = cf
-    {
-        match client
-            .find_by_slug(&l.slug, Some(class_id))
-            .await
-        {
-            Ok(Some((mod_id, _))) => {
-                match client
-                    .get_files(
-                        mod_id,
-                        if mc.is_empty() { None } else { Some(mc) },
-                        if is_mod && !loader.is_empty() { Some(loader) } else { None },
-                    )
-                    .await
-                {
-                    Ok(files) => {
-                        if let Some(f) = files.first() {
-                            cf_lock = Some(LockCurseForge {
-                                project_id: i64::from(mod_id),
-                                file_id: i64::from(f.id),
-                                filename: f.file_name.clone(),
-                                url: f.download_url.clone(),
-                                size: f.file_length,
-                                hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
-                                dependencies: f
-                                    .dependencies
-                                    .iter()
-                                    .filter(|d| {
-                                        d.kind == DepKind::Required || d.kind == DepKind::Optional
-                                    })
-                                    .map(|d| LockDep {
-                                        id: d.project_id.clone(),
-                                        optional: d.kind == DepKind::Optional,
-                                    })
-                                    .collect(),
-                                slug: l.slug.clone(),
-                            });
-                        }
-                    }
-                    Err(e) => warnings.push(format!("curseforge cross: {e}")),
-                }
-            }
-            _ => {}
-        }
+
+    // Only warn about a failed by-name resolution if the counterpart side is
+    // still missing (i.e. hash matching couldn't recover it either).
+    if mr_lock.is_none() && let Some(e) = mr_err {
+        warnings.push(e);
+    }
+    if cf_lock.is_none() && let Some(e) = cf_err {
+        warnings.push(e);
     }
 
     if mr_lock.is_none() && cf_lock.is_none() {
@@ -505,6 +564,7 @@ async fn resolve_modrinth(
             slug: project.slug,
             project_id: project.id,
             version_id: v.id.clone(),
+            version: v.name.clone(),
             filename: v.filename.clone(),
             url: v.url.clone(),
             size: v.size,
@@ -572,8 +632,9 @@ async fn resolve_curseforge(
         LockCurseForge {
             project_id: i64::from(mod_id),
             file_id: i64::from(f.id),
+            version: f.display_name.clone(),
             filename: f.file_name.clone(),
-            url: f.download_url.clone(),
+            url: cf_download_url(f),
             size: f.file_length,
             hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
             dependencies: f
@@ -614,7 +675,8 @@ async fn resolve_dep_modrinth(
         .first()
         .ok_or_else(|| format!("modrinth dep {dep_id}: version not found"))?;
 
-    // Cross-platform: try to find the same mod on CurseForge.
+    // Cross-platform: try to find the same mod on CurseForge, matching the
+    // chosen modrinth file by sha1 (names may differ between platforms).
     let cf_lock = if want_cf && let Some(client) = cf.as_ref() {
         match client
             .find_by_slug(&slug, Some(6))
@@ -622,11 +684,12 @@ async fn resolve_dep_modrinth(
             .map_err(|e| eprintln!("easypacker: cf lookup for dep {slug}: {e}"))
         {
             Ok(Some((mod_id, _))) => match client.get_files(mod_id, mc_filter, loader_filter).await {
-                Ok(files) => files.first().map(|f| LockCurseForge {
+                Ok(files) => cf_file_matching(&files, v.sha1.as_deref()).map(|f| LockCurseForge {
                     project_id: i64::from(mod_id),
                     file_id: i64::from(f.id),
+                    version: f.display_name.clone(),
                     filename: f.file_name.clone(),
-                    url: f.download_url.clone(),
+                    url: cf_download_url(f),
                     size: f.file_length,
                     hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
                     dependencies: f
@@ -659,6 +722,7 @@ async fn resolve_dep_modrinth(
             slug: project.slug,
             project_id: project.id,
             version_id: v.id.clone(),
+            version: v.name.clone(),
             filename: v.filename.clone(),
             url: v.url.clone(),
             size: v.size,
@@ -693,37 +757,53 @@ async fn resolve_dep_curseforge(
         .map_err(|e| format!("cf dep {dep_id}: {e}"))?;
     let loader_filter = if !loader.is_empty() { Some(loader) } else { None };
     let mc_filter = if mc.is_empty() { None } else { Some(mc) };
-    let files = client
+    let mut files = client
         .get_files(mod_id, mc_filter, loader_filter)
         .await
         .map_err(|e| format!("cf dep {dep_id}: {e}"))?;
+    // CF file metadata is inconsistent across projects (some don't tag the
+    // loader / game version the way the filter expects). If the filtered
+    // query came back empty, fall back to the full file list — the lockfile
+    // pins by hash anyway, and a missing counterpart is better than failing.
+    if files.is_empty() {
+        files = client
+            .get_files(mod_id, None, None)
+            .await
+            .map_err(|e| format!("cf dep {dep_id}: {e}"))?;
+    }
     let f = files
         .first()
         .ok_or_else(|| format!("cf dep {dep_id}: version not found"))?;
 
-    // Cross-platform: try to find the same mod on Modrinth.
+    // Cross-platform: try to find the same mod on Modrinth, matching the
+    // chosen curseforge file by sha1 (names may differ between platforms).
     let mr_lock = if want_mr {
         match ModrinthClient::get_project(&slug).await {
             Ok(project) => {
                 match ModrinthClient::get_versions(&slug, mc_filter, loader_filter).await {
-                    Ok(versions) => versions.first().map(|v| LockModrinth {
-                        slug: project.slug.clone(),
-                        project_id: project.id,
-                        version_id: v.id.clone(),
-                        filename: v.filename.clone(),
-                        url: v.url.clone(),
-                        size: v.size,
-                        hashes: LockHashes::new(v.sha1.clone(), v.sha512.clone(), None),
-                        dependencies: v
-                            .dependencies
-                            .iter()
-                            .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
-                            .map(|d| LockDep {
-                                id: d.project_id.clone(),
-                                optional: d.kind == DepKind::Optional,
-                            })
-                            .collect(),
-                    }),
+                    Ok(versions) => {
+                        mr_version_matching(&versions, f.sha1.as_deref()).map(|v| LockModrinth {
+                            slug: project.slug.clone(),
+                            project_id: project.id,
+                            version_id: v.id.clone(),
+                            version: v.name.clone(),
+                            filename: v.filename.clone(),
+                            url: v.url.clone(),
+                            size: v.size,
+                            hashes: LockHashes::new(v.sha1.clone(), v.sha512.clone(), None),
+                            dependencies: v
+                                .dependencies
+                                .iter()
+                                .filter(|d| {
+                                    d.kind == DepKind::Required || d.kind == DepKind::Optional
+                                })
+                                .map(|d| LockDep {
+                                    id: d.project_id.clone(),
+                                    optional: d.kind == DepKind::Optional,
+                                })
+                                .collect(),
+                        })
+                    }
                     Err(e) => {
                         eprintln!("easypacker: mr versions for dep {slug}: {e}");
                         None
@@ -744,8 +824,9 @@ async fn resolve_dep_curseforge(
         curseforge: Some(LockCurseForge {
             project_id: i64::from(mod_id),
             file_id: i64::from(f.id),
+            version: f.display_name.clone(),
             filename: f.file_name.clone(),
-            url: f.download_url.clone(),
+            url: cf_download_url(f),
             size: f.file_length,
             hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
             dependencies: f
@@ -999,6 +1080,7 @@ fn render(lock: &Lock) -> String {
                     format!("slug = {}", tstr(&mr.slug)),
                     format!("project_id = {}", tstr(&mr.project_id)),
                     format!("version_id = {}", tstr(&mr.version_id)),
+                    format!("version = {}", tstr(&mr.version)),
                     format!("filename = {}", tstr(&mr.filename)),
                 ];
                 if let Some(url) = &mr.url {
@@ -1014,6 +1096,7 @@ fn render(lock: &Lock) -> String {
                 let mut fields = vec![
                     format!("project_id = {}", cf.project_id),
                     format!("file_id = {}", cf.file_id),
+                    format!("version = {}", tstr(&cf.version)),
                     format!("filename = {}", tstr(&cf.filename)),
                 ];
                 if let Some(url) = &cf.url {

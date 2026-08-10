@@ -172,20 +172,35 @@ async fn run(
                                                 });
                                             }
                                         } else {
-                                            // Add or change version.
+                                            // Add or change version. Write each
+                                            // platform's own version name (they
+                                            // can differ for the same file, e.g.
+                                            // modrinth "Fresh Animations 1.10.4"
+                                            // vs curseforge "FA 1.10.4").
                                             let has_mr = f.modrinth_version_id.is_some()
                                                 && fb.modrinth_slug.is_some();
                                             let has_cf = f.curseforge_file_id.is_some()
                                                 && fb.curseforge_id.is_some();
-                                            let both = has_mr && has_cf;
+                                            let mr_version = has_mr.then(|| {
+                                                f.modrinth_name
+                                                    .clone()
+                                                    .unwrap_or_else(|| f.name.clone())
+                                            });
+                                            let cf_version = has_cf.then(|| {
+                                                search::readable_cf_name(
+                                                    &f.curseforge_name
+                                                        .clone()
+                                                        .unwrap_or_else(|| f.name.clone()),
+                                                    mr_version.as_deref(),
+                                                )
+                                            });
                                             let spec =
                                                 project::ModSpec::Detailed(project::DetailedSpec {
-                                                    version: both.then(|| f.name.clone()),
+                                                    version: None,
                                                     modrinth: has_mr.then(|| {
                                                         project::ModrinthSpec {
                                                             slug: fb.modrinth_slug.clone(),
-                                                            version: (!both)
-                                                                .then(|| f.name.clone()),
+                                                            version: mr_version,
                                                         }
                                                     }),
                                                     curseforge: has_cf.then(|| {
@@ -193,8 +208,7 @@ async fn run(
                                                             project_id: fb
                                                                 .curseforge_id
                                                                 .map(i64::from),
-                                                            version: (!both)
-                                                                .then(|| f.name.clone()),
+                                                            version: cf_version,
                                                         }
                                                     }),
                                                 });
@@ -734,10 +748,12 @@ fn apply_link_version(
         .and_then(|p| p.curseforge_id)
         .or_else(|| fb.curseforge_id);
 
-    if added_file.size != chosen.size {
+    if !added_file.same_file_as(&chosen) {
         eprintln!(
-            "easypacker: size mismatch linking {plat:?}: {} vs {} bytes — not the same file",
-            added_file.size, chosen.size, plat = platform
+            "easypacker: hash mismatch linking {plat:?}: {} vs {} — not the same file",
+            added_file.sha1.as_deref().unwrap_or("no sha1"),
+            chosen.sha1.as_deref().unwrap_or("no sha1"),
+            plat = platform
         );
     }
 
@@ -913,6 +929,7 @@ async fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync:
                     } else {
                         row.versions.get(selected - 1).map(|f| f.name.clone())
                     };
+                    row.changed = selected > 0;
                     dep.version_picker = None;
                 }
                 apply_dependencies(app);
@@ -962,6 +979,9 @@ async fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync:
                     } else {
                         row.versions.get(selected - 1).map(|f| f.name.clone())
                     };
+                    // Only an explicit non-default pick counts as a change;
+                    // leaving it on default writes nothing.
+                    row.changed = selected > 0;
                     dep.version_picker = None;
                 }
                 apply_dependencies(app);
@@ -990,6 +1010,7 @@ async fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync:
                     match dep.rows.get_mut(idx) {
                         Some(row) if row.optional => {
                             row.enabled = !row.enabled;
+                            row.changed = true;
                             true
                         }
                         _ => false,
@@ -1005,76 +1026,78 @@ async fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync:
     }
 }
 
-/// Reconcile the player's dependency choices against the manifest: deps the
-/// player pinned a version for (or enabled optional deps) become mod entries
-/// scoped to the platform they came from — so the version name is only matched
-/// against the right platform and the counterpart platform is cross-resolved
-/// by the lockfile like any normal mod. Deps the player unpinned/untoggled
-/// are removed from the manifest. Then rebuild the lock (purely TOML-derived).
+/// Write the player's dependency choices into the manifest, but ONLY for
+/// rows the player actively changed in this popup session (`changed`).
+/// Opening the menu never overwrites existing pins.
+///
+/// A pinned version writes BOTH platform specs with each platform's own
+/// version name (modrinth and curseforge may name the same file differently):
+/// `patchouli = { modrinth = { slug, version = "..." }, curseforge = { projectId,
+/// version = "..." } }`. Enabled optional deps get a platform-scoped entry
+/// with no version (lock resolves highest). Untoggled optionals are removed.
 fn apply_dependencies(app: &mut App) {
     let Some(ref dep_state) = app.dependencies else { return };
     let Some(ref fb) = app.file_browse else { return };
     let cat = fb.project_type.clone();
 
-    // Decide per row: insert (platform-scoped spec) or remove.
     let mut to_insert: Vec<(String, project::ModSpec)> = Vec::new();
     let mut to_remove: Vec<String> = Vec::new();
     for row in &dep_state.rows {
-        let pinned = row.version.is_some();
-        if pinned || (row.enabled && row.optional) {
-            // Scope to the platform the dep was declared on: a version name
-            // from modrinth (e.g. "1.21-89-neoforge") only matches modrinth;
-            // the lockfile cross-resolves the other platform like a normal mod.
-            let spec = match (&row.platform, &row.version) {
-                (Platform::Modrinth, Some(v)) => project::ModSpec::Detailed(
-                    project::DetailedSpec {
+        if !row.changed {
+            continue; // untouched by the player -> leave the manifest alone
+        }
+        if let Some(v) = &row.version {
+            // Find the picked merged file to learn each platform's own name.
+            let picked = row.versions.iter().find(|f| f.name == *v);
+            let mr_name = picked
+                .and_then(|f| f.modrinth_name.clone())
+                .or_else(|| (row.platform == Platform::Modrinth).then(|| v.clone()));
+            let cf_name = picked
+                .and_then(|f| f.curseforge_name.clone())
+                .or_else(|| (row.platform == Platform::CurseForge).then(|| v.clone()));
+            // Use the modrinth name when the curseforge one is a raw filename.
+            let cf_version = cf_name.map(|name| {
+                search::readable_cf_name(&name, mr_name.as_deref())
+            });
+            let cf_project_id = picked.and_then(|f| f.curseforge_project_id);
+            let spec = project::ModSpec::Detailed(project::DetailedSpec {
+                version: None,
+                modrinth: mr_name.map(|name| project::ModrinthSpec {
+                    slug: Some(row.id.clone()),
+                    version: Some(name),
+                }),
+                curseforge: cf_version.map(|name| project::CurseForgeSpec {
+                    project_id: cf_project_id.or_else(|| row.project_id.parse::<i64>().ok()),
+                    version: Some(name),
+                }),
+            });
+            to_insert.push((row.id.clone(), spec));
+        } else if row.optional && row.enabled {
+            // Enabled optional at default: include it, no version pin.
+            let spec = match row.platform {
+                Platform::Modrinth => project::ModSpec::Detailed(project::DetailedSpec {
+                    version: None,
+                    modrinth: Some(project::ModrinthSpec {
+                        slug: Some(row.id.clone()),
                         version: None,
-                        modrinth: Some(project::ModrinthSpec {
-                            slug: Some(row.id.clone()),
-                            version: Some(v.clone()),
-                        }),
-                        curseforge: None,
-                    },
-                ),
-                (Platform::CurseForge, Some(v)) => project::ModSpec::Detailed(
-                    project::DetailedSpec {
+                    }),
+                    curseforge: None,
+                }),
+                Platform::CurseForge => project::ModSpec::Detailed(project::DetailedSpec {
+                    version: None,
+                    modrinth: None,
+                    curseforge: Some(project::CurseForgeSpec {
+                        project_id: row.project_id.parse::<i64>().ok(),
                         version: None,
-                        modrinth: None,
-                        curseforge: Some(project::CurseForgeSpec {
-                            project_id: row.project_id.parse::<i64>().ok(),
-                            version: Some(v.clone()),
-                        }),
-                    },
-                ),
-                // Enabled optional at default version: no pin, resolve the
-                // highest matching on the platform it came from.
-                (Platform::Modrinth, None) => project::ModSpec::Detailed(
-                    project::DetailedSpec {
-                        version: None,
-                        modrinth: Some(project::ModrinthSpec {
-                            slug: Some(row.id.clone()),
-                            version: None,
-                        }),
-                        curseforge: None,
-                    },
-                ),
-                (Platform::CurseForge, None) => project::ModSpec::Detailed(
-                    project::DetailedSpec {
-                        version: None,
-                        modrinth: None,
-                        curseforge: Some(project::CurseForgeSpec {
-                            project_id: row.project_id.parse::<i64>().ok(),
-                            version: None,
-                        }),
-                    },
-                ),
+                    }),
+                }),
             };
             to_insert.push((row.id.clone(), spec));
-        } else {
-            // Untoggled optional or reset-to-default: drop the manifest entry
-            // so it stops being pinned (the lock resolves it fresh / skips it).
+        } else if row.optional && !row.enabled {
+            // Untoggled: stop pinning it.
             to_remove.push(row.id.clone());
         }
+        // Required dep reset to default: write nothing, lock resolves highest.
     }
 
     let cwd = std::env::current_dir().unwrap_or_default();

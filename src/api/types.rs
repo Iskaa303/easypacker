@@ -74,5 +74,33 @@ pub struct ProjectFile {
     pub modrinth_url: Option<String>,
     pub curseforge_file_id: Option<i32>,
     pub curseforge_url: Option<String>,
+    /// CurseForge project id (modId) — needed to write a valid manifest
+    /// entry when the dep was declared on modrinth.
+    pub curseforge_project_id: Option<i64>,
+    /// sha1 of the file, present on both platforms — used to treat two files
+    /// with different names (modrinth vs curseforge) as the same version.
+    pub sha1: Option<String>,
+    /// Per-platform version names, kept when merging across platforms so the
+    /// manifest can pin each platform's own name.
+    pub modrinth_name: Option<String>,
+    pub curseforge_name: Option<String>,
     pub dependencies: Vec<Dependency>,
+}
+
+impl ProjectFile {
+    /// True if this file is the same release as `other` on a different
+    /// platform. Compared by sha1 when both sides have it (names may differ
+    /// between modrinth and curseforge); falls back to size+name.
+    pub fn same_file_as(&self, other: &ProjectFile) -> bool {
+        match (&self.sha1, &other.sha1) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => {
+                self.size == other.size
+                    && self
+                        .name
+                        .to_lowercase()
+                        == other.name.to_lowercase()
+            }
+        }
+    }
 }
