@@ -1,5 +1,6 @@
 use crate::api::filters;
-use crate::types::{BrowseState, FilterKind};
+use crate::project::ModpackProject;
+use crate::types::{BrowseState, ExportPhase, ExportState, FilterKind};
 use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
@@ -17,7 +18,7 @@ pub struct WelcomeState {
     pub show_path_input: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum WelcomeAction {
     Create,
     Open(std::path::PathBuf),
@@ -196,11 +197,39 @@ pub fn render_main_menu(frame: &mut Frame, area: Rect, project_name: &str, selec
         )),
         Line::from(Span::styled(
             format!(
-                " {}  Project settings{}",
+                " {}  Export modpack{}",
                 if selected == 1 { "▸" } else { " " },
                 if selected == 1 { " ◄" } else { "" },
             ),
             if selected == 1 {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        )),
+        Line::from(Span::styled(
+            format!(
+                " {}  Project settings{}",
+                if selected == 2 { "▸" } else { " " },
+                if selected == 2 { " ◄" } else { "" },
+            ),
+            if selected == 2 {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        )),
+        Line::from(Span::styled(
+            format!(
+                " {}  Quit{}",
+                if selected == 3 { "▸" } else { " " },
+                if selected == 3 { " ◄" } else { "" },
+            ),
+            if selected == 3 {
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
@@ -239,13 +268,87 @@ pub fn handle_main_menu_key(key: KeyCode, selected: &mut usize) -> Option<usize>
             None
         }
         KeyCode::Down => {
-            *selected = selected.saturating_add(1).min(1);
+            *selected = selected.saturating_add(1).min(3);
             None
         }
         KeyCode::Char('\n') | KeyCode::Enter => Some(*selected),
-        KeyCode::Char('q') => Some(2), // quit
+        KeyCode::Char('q') => Some(3), // quit
         _ => None,
     }
+}
+
+// ── Export screen ────────────────────────────────────────
+
+const EXPORT_TARGETS: [&str; 3] = [
+    "CurseForge (.zip)",
+    "Modrinth (.mrpack)",
+    "Prism Launcher (.zip)",
+];
+
+pub fn render_export_menu(frame: &mut Frame, area: Rect, state: &ExportState) {
+    let choosing = state.phase.is_none();
+    let mut lines = vec![Line::from("")];
+    for (i, t) in EXPORT_TARGETS.iter().enumerate() {
+        let selected = choosing && state.target == i;
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {}  {}{}",
+                if selected { "▸" } else { " " },
+                t,
+                if selected { " ◄" } else { "" },
+            ),
+            if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        )));
+    }
+    lines.push(Line::from(""));
+    let side_label = if state.server { "server" } else { "client" };
+    let other = if state.server { "client" } else { "server" };
+    lines.push(Line::from(vec![
+        Span::styled(" Side: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            side_label,
+            Style::default()
+                .fg(if state.server {
+                    Color::Magenta
+                } else {
+                    Color::Cyan
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  (Tab for {other})"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    let (status, color) = match &state.phase {
+        Some(ExportPhase::Busy) => (" Exporting… ".to_owned(), Color::Yellow),
+        Some(ExportPhase::Done(msg)) if msg.starts_with("Export failed") => {
+            (format!(" {msg}"), Color::Red)
+        }
+        Some(ExportPhase::Done(msg)) => (format!(" {msg}"), Color::Green),
+        None => (
+            " ↑↓ choose target, Tab toggles client/server, Enter to export, Esc back ".to_owned(),
+            Color::DarkGray,
+        ),
+    };
+    lines.push(Line::from(Span::styled(status, Style::default().fg(color))));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" easypacker — Export Modpack ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
 }
 
 // ── Form system (shared by Settings + Create Project) ─────
@@ -313,7 +416,10 @@ pub fn new_create_form() -> FormState {
                 label: "Minecraft",
                 value: String::new(),
                 kind: FieldKind::Pick {
-                    options: filters::VERSIONS.iter().map(|s| s.to_string()).collect(),
+                    options: filters::VERSIONS
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
                     kind: FilterKind::Version,
                 },
             },
@@ -321,7 +427,10 @@ pub fn new_create_form() -> FormState {
                 label: "Loader",
                 value: String::new(),
                 kind: FieldKind::Pick {
-                    options: filters::LOADERS.iter().map(|s| s.to_string()).collect(),
+                    options: filters::LOADERS
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
                     kind: FilterKind::Loader,
                 },
             },
@@ -355,65 +464,62 @@ pub fn new_create_form() -> FormState {
     }
 }
 
-pub fn new_settings_form(
-    name: &str,
-    version: &str,
-    authors: &str,
-    credits: &str,
-    description: &str,
-    minecraft: &str,
-    loader: &str,
-    platforms: &[String],
-    website: &Option<String>,
-    discord: &Option<String>,
-    github: &Option<String>,
-) -> FormState {
+pub fn new_settings_form(proj: &ModpackProject) -> FormState {
+    let website = proj.links.website.as_deref();
+    let discord = proj.links.discord.as_deref();
+    let github = proj.links.github.as_deref();
     FormState {
         fields: vec![
             FormField {
                 label: "Name",
-                value: name.to_owned(),
+                value: proj.name.clone(),
                 kind: FieldKind::Text,
             },
             FormField {
                 label: "Version",
-                value: version.to_owned(),
+                value: proj.version.clone(),
                 kind: FieldKind::Text,
             },
             FormField {
                 label: "Authors",
-                value: authors.to_owned(),
+                value: proj.authors.clone(),
                 kind: FieldKind::Text,
             },
             FormField {
                 label: "Credits",
-                value: credits.to_owned(),
+                value: proj.credits.clone(),
                 kind: FieldKind::Text,
             },
             FormField {
                 label: "Description",
-                value: description.to_owned(),
+                value: proj.description.clone(),
                 kind: FieldKind::Text,
             },
             FormField {
                 label: "Minecraft",
-                value: minecraft.to_owned(),
+                value: proj.minecraft.clone(),
                 kind: FieldKind::Pick {
-                    options: filters::VERSIONS.iter().map(|s| s.to_string()).collect(),
+                    options: filters::VERSIONS
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
                     kind: FilterKind::Version,
                 },
             },
             FormField {
                 label: "Loader",
-                value: loader.to_owned(),
+                value: proj.loader.clone(),
                 kind: FieldKind::Pick {
-                    options: filters::LOADERS.iter().map(|s| s.to_string()).collect(),
+                    options: filters::LOADERS
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
                     kind: FilterKind::Loader,
                 },
             },
             FormField {
                 label: "Platforms",
-                value: platforms.join(", "),
+                value: proj.platforms.join(", "),
                 kind: FieldKind::Pick {
                     options: vec!["modrinth".into(), "curseforge".into()],
                     kind: FilterKind::Platform,
@@ -421,17 +527,17 @@ pub fn new_settings_form(
             },
             FormField {
                 label: "Website",
-                value: website.clone().unwrap_or_default(),
+                value: website.unwrap_or_default().to_owned(),
                 kind: FieldKind::Text,
             },
             FormField {
                 label: "Discord",
-                value: discord.clone().unwrap_or_default(),
+                value: discord.unwrap_or_default().to_owned(),
                 kind: FieldKind::Text,
             },
             FormField {
                 label: "GitHub",
-                value: github.clone().unwrap_or_default(),
+                value: github.unwrap_or_default().to_owned(),
                 kind: FieldKind::Text,
             },
         ],
@@ -442,6 +548,12 @@ pub fn new_settings_form(
 }
 
 // ── Form rendering ─────────────────────────────────────────
+
+/// Terminal coordinates are u16; form indexes/lengths can't realistically
+/// overflow that, so clamp instead of panicking on `try_from`.
+fn u16c(v: usize) -> u16 {
+    u16::try_from(v).unwrap_or(u16::MAX)
+}
 
 pub fn render_form(frame: &mut Frame, area: Rect, title: &str, form: &FormState) {
     let mut lines: Vec<Line> = Vec::new();
@@ -466,7 +578,7 @@ pub fn render_form(frame: &mut Frame, area: Rect, title: &str, form: &FormState)
 
         let display = if field.value.is_empty() {
             match field.kind {
-                FieldKind::Text => "".into(),
+                FieldKind::Text => String::new(),
                 FieldKind::Pick { .. } => "— pick —".into(),
             }
         } else {
@@ -478,15 +590,13 @@ pub fn render_form(frame: &mut Frame, area: Rect, title: &str, form: &FormState)
             _ => String::new(),
         };
 
-        match field.kind {
-            _ => {
-                lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{}: ", field.label), label_style),
-                    Span::styled(display, val_style),
-                    Span::styled(suffix, Style::default().fg(Color::DarkGray)),
-                ]));
-            }
+        {
+            lines.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{}: ", field.label), label_style),
+                Span::styled(display, val_style),
+                Span::styled(suffix, Style::default().fg(Color::DarkGray)),
+            ]));
         }
     }
 
@@ -519,14 +629,13 @@ pub fn render_form(frame: &mut Frame, area: Rect, title: &str, form: &FormState)
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
-    if form.focused {
-        if let Some(field) = form.fields.get(form.selected) {
-            if matches!(field.kind, FieldKind::Text) {
-                let cx = area.x + 1 + 2 + field.label.len() as u16 + 2 + form.cursor_pos as u16;
-                let cy = area.y + 1 + form.selected as u16;
-                frame.set_cursor_position((cx, cy));
-            }
-        }
+    if form.focused
+        && let Some(field) = form.fields.get(form.selected)
+        && matches!(field.kind, FieldKind::Text)
+    {
+        let cx = area.x + 1 + 2 + u16c(field.label.len()) + 2 + u16c(form.cursor_pos);
+        let cy = area.y + 1 + u16c(form.selected);
+        frame.set_cursor_position((cx, cy));
     }
 }
 
@@ -547,7 +656,7 @@ pub fn handle_form_key(form: &mut FormState, key: KeyCode) -> FormAction {
             }
             KeyCode::Char('\n') | KeyCode::Enter => match form.fields[form.selected].kind {
                 FieldKind::Pick { .. } => FormAction::PickField(form.selected),
-                _ => FormAction::None,
+                FieldKind::Text => FormAction::None,
             },
             KeyCode::Left if form.cursor_pos > 0 => {
                 form.cursor_pos -= 1;
@@ -599,9 +708,8 @@ pub fn handle_form_key(form: &mut FormState, key: KeyCode) -> FormAction {
                 FormAction::None
             }
             KeyCode::Char('\n') | KeyCode::Enter => {
-                match form.fields[form.selected].kind {
-                    FieldKind::Pick { .. } => return FormAction::PickField(form.selected),
-                    _ => {}
+                if let FieldKind::Pick { .. } = form.fields[form.selected].kind {
+                    return FormAction::PickField(form.selected);
                 }
                 form.focused = true;
                 form.cursor_pos = form.fields[form.selected].value.len();
@@ -609,7 +717,6 @@ pub fn handle_form_key(form: &mut FormState, key: KeyCode) -> FormAction {
             }
             KeyCode::Char('s') => FormAction::Save,
             KeyCode::Char('q') => FormAction::Cancel,
-            KeyCode::Esc => FormAction::None,
             _ => FormAction::None,
         }
     }

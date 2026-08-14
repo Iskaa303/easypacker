@@ -18,7 +18,10 @@ fn sample_lock() -> Lock {
                 url: Some("https://cdn.modrinth.com/data/x/sodium.jar".into()),
                 size: 1,
                 hashes: LockHashes::new(Some("aaa".into()), Some("bbb".into()), None),
-                dependencies: vec![LockDep { id: "citadel".into(), optional: false }],
+                dependencies: vec![LockDep {
+                    id: "citadel".into(),
+                    optional: false,
+                }],
             }),
             curseforge: Some(LockCurseForge {
                 project_id: 394_468,
@@ -69,8 +72,14 @@ fn lock_renders_in_user_shape() {
     assert_eq!(m["curseforge"]["file_id"].as_integer(), Some(12_345));
     assert_eq!(m["curseforge"]["hashes"]["md5"].as_str(), Some("ddd"));
     // Dependency edge (cargo-style id list, multi-line like Cargo.lock).
-    assert!(out.contains("dependencies = [\n    \"citadel\",\n]"), "not multiline:\n{out}");
-    assert_eq!(m["dependencies"].as_array().unwrap(), &[toml::Value::String("citadel".into())]);
+    assert!(
+        out.contains("dependencies = [\n    \"citadel\",\n]"),
+        "not multiline:\n{out}"
+    );
+    assert_eq!(
+        m["dependencies"].as_array().unwrap(),
+        &[toml::Value::String("citadel".into())]
+    );
 }
 
 #[test]
@@ -102,16 +111,22 @@ fn rewrite_edges_keeps_required_only_and_rewrites_to_slugs() {
             size: 1,
             hashes: None,
             dependencies: vec![
-                LockDep { id: "nU0bVIaL".into(), optional: false }, // patchouli, required
-                LockDep { id: "someopt".into(), optional: true },    // optional -> dropped
+                LockDep {
+                    id: "nU0bVIaL".into(),
+                    optional: false,
+                }, // patchouli, required
+                LockDep {
+                    id: "someopt".into(),
+                    optional: true,
+                }, // optional -> dropped
             ],
         }),
         curseforge: None,
-
     };
-    let slug_of = std::collections::HashMap::from([
-        ((Platform::Modrinth, "nU0bVIaL".to_string()), "patchouli".to_string()),
-    ]);
+    let slug_of = std::collections::HashMap::from([(
+        (Platform::Modrinth, "nU0bVIaL".to_string()),
+        "patchouli".to_string(),
+    )]);
     let known = std::collections::HashSet::from(["patchouli".to_string()]);
     rewrite_edges(&mut entry, &slug_of, &known);
     let deps = &entry.modrinth.as_ref().unwrap().dependencies;
@@ -136,11 +151,17 @@ fn rewrite_edges_drops_unknown_deps() {
             url: None,
             size: 1,
             hashes: None,
-            dependencies: vec![LockDep { id: "unknown".into(), optional: false }],
+            dependencies: vec![LockDep {
+                id: "unknown".into(),
+                optional: false,
+            }],
         }),
         curseforge: None,
-
     };
-    rewrite_edges(&mut entry, &std::collections::HashMap::new(), &std::collections::HashSet::new());
+    rewrite_edges(
+        &mut entry,
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::new(),
+    );
     assert!(entry.modrinth.as_ref().unwrap().dependencies.is_empty());
 }

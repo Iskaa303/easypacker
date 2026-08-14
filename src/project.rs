@@ -74,6 +74,26 @@ impl DerefMut for CategoryMap {
     }
 }
 
+/// Which side a project runs on. `Both` is the default for mods;
+/// resourcepacks/shaders default to `Client`, datapacks to `Server`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    Client,
+    Server,
+    Both,
+}
+
+impl Side {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Server => "server",
+            Self::Both => "both",
+        }
+    }
+}
+
 /// One manifest entry. Either `sodium = "Version display name"` (the key is
 /// the platform slug, same version everywhere) or a detailed inline table.
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +113,10 @@ pub struct DetailedSpec {
     pub modrinth: Option<ModrinthSpec>,
     #[serde(default)]
     pub curseforge: Option<CurseForgeSpec>,
+    /// Force the side this project runs on (client / server). Unset =
+    /// platform default (`both` for mods).
+    #[serde(default)]
+    pub side: Option<Side>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -155,17 +179,25 @@ impl ModSpec {
 
     /// A `Simple` spec targets all platforms.
     /// A `Detailed` spec targets only platforms it explicitly names.
-    pub fn has_modrinth(&self) -> bool {
+    pub const fn has_modrinth(&self) -> bool {
         match self {
             Self::Simple(_) => true,
             Self::Detailed(d) => d.modrinth.is_some(),
         }
     }
 
-    pub fn has_curseforge(&self) -> bool {
+    pub const fn has_curseforge(&self) -> bool {
         match self {
             Self::Simple(_) => true,
             Self::Detailed(d) => d.curseforge.is_some(),
+        }
+    }
+
+    /// The side the player forced for this entry, if any.
+    pub const fn side(&self) -> Option<Side> {
+        match self {
+            Self::Simple(_) => None,
+            Self::Detailed(d) => d.side,
         }
     }
 }
@@ -391,6 +423,9 @@ fn render_spec(d: &DetailedSpec) -> String {
     }
     if let Some(v) = &d.version {
         parts.push(format!("version = {}", tstr(v)));
+    }
+    if let Some(s) = d.side {
+        parts.push(format!("side = {}", tstr(s.as_str())));
     }
     format!("{{ {} }}", parts.join(", "))
 }

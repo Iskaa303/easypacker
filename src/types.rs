@@ -1,16 +1,16 @@
 use crate::api::types::{Platform, ProjectFile, SearchResult};
 use std::collections::HashSet;
 
-#[derive(PartialEq)]
-pub(crate) enum Focus {
+#[derive(PartialEq, Eq)]
+pub enum Focus {
     Neutral,
     Query,
     Filters,
     Results,
 }
 
-#[derive(Clone, PartialEq)]
-pub(crate) enum FilterKind {
+#[derive(Clone, PartialEq, Eq)]
+pub enum FilterKind {
     Version,
     Loader,
     Type,
@@ -18,17 +18,17 @@ pub(crate) enum FilterKind {
 }
 
 impl FilterKind {
-    pub(crate) fn label(&self) -> &str {
+    pub(crate) const fn label(&self) -> &str {
         match self {
-            FilterKind::Version => "Version",
-            FilterKind::Loader => "Loader",
-            FilterKind::Type => "Type",
-            FilterKind::Platform => "Platform",
+            Self::Version => "Version",
+            Self::Loader => "Loader",
+            Self::Type => "Type",
+            Self::Platform => "Platform",
         }
     }
 }
 
-pub(crate) struct BrowseState {
+pub struct BrowseState {
     pub kind: FilterKind,
     pub options: Vec<String>,
     pub filtered: Vec<usize>,
@@ -37,7 +37,7 @@ pub(crate) struct BrowseState {
     pub toggled: HashSet<usize>,
     pub scroll: usize,
 }
-pub(crate) struct FileBrowseState {
+pub struct FileBrowseState {
     pub project_title: String,
     pub modrinth_slug: Option<String>,
     pub curseforge_id: Option<i32>,
@@ -48,7 +48,7 @@ pub(crate) struct FileBrowseState {
     pub already_added: bool,
     pub added_index: Option<usize>,
 }
-pub(crate) enum BrowseAction {
+pub enum BrowseAction {
     Toggle(FilterKind),
     Close,
     None,
@@ -57,7 +57,7 @@ pub(crate) enum BrowseAction {
 /// Overlay popup for linking the same version on the other platform.
 /// `picked.is_none()` => Query stage (search results).
 /// `picked.is_some()` => Versions stage (the picked project's files).
-pub(crate) struct LinkVersionState {
+pub struct LinkVersionState {
     pub platform: Platform,
     pub query: String,
     pub cursor: usize,
@@ -72,14 +72,14 @@ pub(crate) struct LinkVersionState {
 
 /// Project chosen in the link popup, to fetch versions for.
 #[derive(Clone)]
-pub(crate) struct PickedProject {
+pub struct PickedProject {
     pub modrinth_slug: Option<String>,
     pub curseforge_id: Option<i32>,
 }
 
 /// One discovered dependency for the dependency popup.
 #[derive(Clone)]
-pub(crate) struct DepRow {
+pub struct DepRow {
     /// easypacker id = manifest key = modrinth slug (or cf slug/name).
     pub id: String,
     /// Raw platform project id (modrinth project id / cf modId) for API calls.
@@ -103,7 +103,7 @@ pub(crate) struct DepRow {
 
 /// Dependency popup: lists required + optional deps for the browsed mod,
 /// lets the player enable optional deps and pin specific versions.
-pub(crate) struct DependencyState {
+pub struct DependencyState {
     pub rows: Vec<DepRow>,
     pub selected: usize,
     pub scroll: usize,
@@ -113,13 +113,13 @@ pub(crate) struct DependencyState {
 }
 
 #[derive(Clone)]
-pub(crate) struct DepVersionPicker {
+pub struct DepVersionPicker {
     pub row: usize,
     pub selected: usize,
     pub scroll: usize,
 }
 
-pub(crate) struct FiltersState {
+pub struct FiltersState {
     pub version: String,
     pub loader: String,
     pub project_type: String,
@@ -137,8 +137,8 @@ impl Default for FiltersState {
     }
 }
 
-#[derive(PartialEq)]
-pub(crate) enum Status {
+#[derive(PartialEq, Eq)]
+pub enum Status {
     Idle,
     Searching,
     Error(String),
@@ -146,7 +146,7 @@ pub(crate) enum Status {
     Done,
 }
 
-pub(crate) enum AppEvent {
+pub enum AppEvent {
     Results {
         results: Vec<SearchResult>,
         offset: usize,
@@ -174,13 +174,29 @@ pub(crate) enum AppEvent {
     DepsLoaded {
         rows: Vec<DepRow>,
     },
+    ExportDone(String),
 }
-#[derive(Clone, PartialEq)]
-pub(crate) enum AppMode {
+#[derive(Clone, PartialEq, Eq)]
+pub enum AppMode {
     Welcome,
     MainMenu,
     Search,
     FileBrowse,
     Settings,
     CreateProject,
+    Export,
+}
+
+/// Export screen: pick a target, then show busy/result status.
+pub struct ExportState {
+    /// Index into `export::ExportTarget::ALL`.
+    pub target: usize,
+    /// Server export (client-only mods dropped).
+    pub server: bool,
+    pub phase: Option<ExportPhase>,
+}
+
+pub enum ExportPhase {
+    Busy,
+    Done(String),
 }

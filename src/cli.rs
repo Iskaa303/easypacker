@@ -16,7 +16,7 @@ pub struct Cli {
     #[arg(short, long)]
     pub query: Option<String>,
 
-    /// Use CurseForge (default: Modrinth)
+    /// Use `CurseForge` (default: Modrinth)
     #[arg(long)]
     pub cf: bool,
 
@@ -47,7 +47,19 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
 
-    /// CurseForge API key (overrides config file / env)
+    /// `CurseForge` API key (overrides config file / env)
     #[arg(long)]
     pub api_key: Option<String>,
+
+    /// Export the current pack: curseforge, modrinth or prism
+    #[arg(long, value_name = "TARGET")]
+    pub export: Option<String>,
+
+    /// Server export: client-only mods are dropped (default: client)
+    #[arg(long)]
+    pub server: bool,
+
+    /// Directory to write the exported pack to (default: current dir)
+    #[arg(long)]
+    pub output: Option<String>,
 }

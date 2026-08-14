@@ -6,7 +6,10 @@ use crate::api::{
 use crate::app::App;
 use crate::config::Config;
 use crate::project;
-use crate::types::*;
+use crate::types::{
+    AppEvent, BrowseAction, BrowseState, DepRow, DependencyState, FileBrowseState, FilterKind,
+    Focus, LinkVersionState, Status,
+};
 use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -17,11 +20,11 @@ use ratatui_image::Image;
 use std::collections::HashSet;
 use std::time::Duration;
 
-pub(crate) const TICK_RATE: Duration = Duration::from_millis(100);
+pub const TICK_RATE: Duration = Duration::from_millis(100);
 
-pub(crate) fn handle_browse_key(browse: &mut BrowseState, key: KeyCode) -> BrowseAction {
+pub fn handle_browse_key(browse: &mut BrowseState, key: KeyCode) -> BrowseAction {
     match key {
-        KeyCode::Esc => BrowseAction::Close,
+        KeyCode::Esc | KeyCode::Tab => BrowseAction::Close,
         KeyCode::Char('\n') | KeyCode::Enter => {
             if browse.filtered.is_empty() {
                 return BrowseAction::None;
@@ -51,7 +54,6 @@ pub(crate) fn handle_browse_key(browse: &mut BrowseState, key: KeyCode) -> Brows
             let kind = browse.kind.clone();
             BrowseAction::Toggle(kind)
         }
-        KeyCode::Tab => BrowseAction::Close,
         KeyCode::Up => {
             if browse.selected > 0 {
                 browse.selected -= 1;
@@ -66,7 +68,7 @@ pub(crate) fn handle_browse_key(browse: &mut BrowseState, key: KeyCode) -> Brows
             if browse.selected < max {
                 browse.selected += 1;
             }
-            let visible = browse.filtered.len().min(15).max(5);
+            let visible = browse.filtered.len().clamp(5, 15);
             if browse.selected >= browse.scroll + visible - 1 {
                 browse.scroll += 1;
             }
@@ -77,12 +79,7 @@ pub(crate) fn handle_browse_key(browse: &mut BrowseState, key: KeyCode) -> Brows
             update_filtered(browse);
             BrowseAction::None
         }
-        KeyCode::Backspace => {
-            browse.filter_text.pop();
-            update_filtered(browse);
-            BrowseAction::None
-        }
-        KeyCode::Delete => {
+        KeyCode::Backspace | KeyCode::Delete => {
             browse.filter_text.pop();
             update_filtered(browse);
             BrowseAction::None
@@ -111,7 +108,9 @@ fn update_filtered(browse: &mut BrowseState) {
     }
 }
 
-pub(crate) async fn handle_key(
+/// One arm per focus zone; the arms are short and the match is the function.
+#[allow(clippy::too_many_lines)]
+pub fn handle_key(
     app: &mut App,
     key: KeyCode,
     cfg: &Config,
@@ -144,7 +143,7 @@ pub(crate) async fn handle_key(
             KeyCode::End => app.cursor_pos = app.query.len(),
             KeyCode::Enter => {
                 app.search_offset = 0;
-                start_search(app, cfg, tx).await;
+                start_search(app, cfg, tx);
             }
             _ => {}
         },
@@ -156,7 +155,6 @@ pub(crate) async fn handle_key(
                     0 => FilterKind::Version,
                     1 => FilterKind::Loader,
                     2 => FilterKind::Type,
-                    3 => FilterKind::Platform,
                     _ => FilterKind::Platform,
                 };
                 let current_val = match &kind {
@@ -180,11 +178,18 @@ pub(crate) async fn handle_key(
                     scroll: 0,
                 });
                 let options: Vec<String> = match kind {
-                    FilterKind::Version => {
-                        filters::VERSIONS.iter().map(|s| s.to_string()).collect()
-                    }
-                    FilterKind::Loader => filters::LOADERS.iter().map(|s| s.to_string()).collect(),
-                    FilterKind::Type => filters::TYPES.iter().map(|s| s.to_string()).collect(),
+                    FilterKind::Version => filters::VERSIONS
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
+                    FilterKind::Loader => filters::LOADERS
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
+                    FilterKind::Type => filters::TYPES
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
                     FilterKind::Platform => vec!["modrinth".into(), "curseforge".into()],
                 };
                 let _ = tx.try_send(AppEvent::BrowseOptions {
@@ -210,7 +215,7 @@ pub(crate) async fn handle_key(
                     app.scroll += 1;
                 }
                 if app.selected + 5 >= app.results.len() && app.status != Status::Searching {
-                    start_search(app, cfg, tx).await;
+                    start_search(app, cfg, tx);
                 }
             }
             KeyCode::PageUp => {
@@ -236,7 +241,7 @@ pub(crate) async fn handle_key(
             KeyCode::Enter => {
                 let idx = app.selected;
                 if idx < app.results.len() {
-                    start_file_fetch(app, cfg, tx).await;
+                    start_file_fetch(app, cfg, tx);
                 }
             }
             _ => {}
@@ -244,7 +249,7 @@ pub(crate) async fn handle_key(
     }
 }
 
-pub(crate) async fn handle_apikey_key(
+pub fn handle_apikey_key(
     app: &mut App,
     key: KeyCode,
     cfg: &mut Config,
@@ -258,10 +263,7 @@ pub(crate) async fn handle_apikey_key(
         KeyCode::Char(c) => {
             app.api_key_input.push(c);
         }
-        KeyCode::Backspace => {
-            app.api_key_input.pop();
-        }
-        KeyCode::Delete => {
+        KeyCode::Backspace | KeyCode::Delete => {
             app.api_key_input.pop();
         }
         KeyCode::Enter => {
@@ -286,11 +288,9 @@ pub(crate) async fn handle_apikey_key(
     }
 }
 
-pub(crate) async fn start_search(
-    app: &mut App,
-    cfg: &Config,
-    tx: &tokio::sync::mpsc::Sender<AppEvent>,
-) {
+/// Spawns the API work; the outer function has no awaits of its own.
+#[allow(clippy::too_many_lines)]
+pub fn start_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
     if app.query.is_empty() {
         return;
     }
@@ -331,14 +331,14 @@ pub(crate) async fn start_search(
         .filters
         .platform
         .split(", ")
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
-    if cfg.get_api_key(None).is_err() && platforms.iter().any(|p| p == "curseforge") {
+    if cfg.get_api_key(None, None).is_err() && platforms.iter().any(|p| p == "curseforge") {
         app.status = Status::ApiKeyPrompt;
         return;
     }
-    let api_key = cfg.get_api_key(None).ok();
+    let api_key = cfg.get_api_key(None, None).ok();
     let current_offset = app.search_offset;
     app.search_offset += 25;
     tokio::spawn(async move {
@@ -355,16 +355,13 @@ pub(crate) async fn start_search(
                     }
                 },
                 "curseforge" => {
-                    let key = match &api_key {
-                        Some(k) => k,
-                        None => {
-                            let _ = tx
-                                .send(AppEvent::Error("CurseForge API key not configured.".into()))
-                                .await;
-                            continue;
-                        }
+                    let Some(k) = &api_key else {
+                        let _ = tx
+                            .send(AppEvent::Error("CurseForge API key not configured.".into()))
+                            .await;
+                        continue;
                     };
-                    match CurseForgeClient::new(key).search(&filters).await {
+                    match CurseForgeClient::new(k).search(&filters).await {
                         Ok(results) => Some(results),
                         Err(e) => {
                             let _ = tx
@@ -378,7 +375,7 @@ pub(crate) async fn start_search(
             };
             if let Some(mut results) = event {
                 if let Some(ref pt) = filters.project_type {
-                    let allowed: Vec<&str> = pt.split(", ").map(|s| s.trim()).collect();
+                    let allowed: Vec<&str> = pt.split(", ").map(str::trim).collect();
                     results.retain(|r| allowed.contains(&r.project_type.to_lowercase().as_str()));
                 }
                 for r in results {
@@ -390,7 +387,10 @@ pub(crate) async fn start_search(
                                 existing.cross.modrinth_downloads = r.downloads;
                                 existing.cross.modrinth_url = r.url;
                                 if r.cross.modrinth_slug.is_some() {
-                                    existing.cross.modrinth_slug = r.cross.modrinth_slug.clone();
+                                    existing
+                                        .cross
+                                        .modrinth_slug
+                                        .clone_from(&r.cross.modrinth_slug);
                                 }
                             }
                             Platform::CurseForge => {
@@ -403,11 +403,11 @@ pub(crate) async fn start_search(
                         match entry.platform {
                             Platform::Modrinth => {
                                 entry.cross.modrinth_downloads = entry.downloads;
-                                entry.cross.modrinth_url = entry.url.clone();
+                                entry.cross.modrinth_url.clone_from(&entry.url);
                             }
                             Platform::CurseForge => {
                                 entry.cross.curseforge_downloads = entry.downloads;
-                                entry.cross.curseforge_url = entry.url.clone();
+                                entry.cross.curseforge_url.clone_from(&entry.url);
                             }
                         }
                         all.push(entry);
@@ -427,7 +427,9 @@ pub(crate) async fn start_search(
     });
 }
 
-async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+/// Spawns the API work; the outer function has no awaits of its own.
+#[allow(clippy::too_many_lines)]
+fn start_file_fetch(app: &App, cfg: &Config, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
     let idx = app.selected;
     if idx >= app.results.len() {
         return;
@@ -443,7 +445,7 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
     let modrinth_slug = r.cross.modrinth_slug.clone();
     let curseforge_id = r.cross.curseforge_id;
     let project_type = r.project_type.clone();
-    let api_key = cfg.get_api_key(None).ok();
+    let api_key = cfg.get_api_key(None, None).ok();
     let tx = tx.clone();
     tokio::spawn(async move {
         let mut all_files: Vec<ProjectFile> = Vec::new();
@@ -482,14 +484,16 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                                 existing.downloads = pf.downloads;
                             }
                             if pf.modrinth_version_id.is_some() {
-                                existing.modrinth_version_id = pf.modrinth_version_id.clone();
-                                existing.modrinth_url = pf.modrinth_url.clone();
+                                existing
+                                    .modrinth_version_id
+                                    .clone_from(&pf.modrinth_version_id);
+                                existing.modrinth_url.clone_from(&pf.modrinth_url);
                             }
                             if pf.modrinth_name.is_some() {
-                                existing.modrinth_name = pf.modrinth_name.clone();
+                                existing.modrinth_name.clone_from(&pf.modrinth_name);
                             }
                             if pf.url.is_some() {
-                                existing.url = pf.url.clone();
+                                existing.url.clone_from(&pf.url);
                             }
                         } else {
                             all_files.push(pf);
@@ -502,73 +506,73 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
                 }
             }
         }
-        if let Some(id) = curseforge_id {
-            if let Some(ref key) = api_key {
-                let client = CurseForgeClient::new(key);
-                match client.get_files(id, None, None).await {
-                    Ok(files) => {
-                        for cf in files {
-                            let known: Vec<&str> = filters::LOADERS.to_vec();
-                            let loaders: Vec<String> = cf
-                                .game_versions
-                                .iter()
-                                .filter(|v| known.iter().any(|l| v.eq_ignore_ascii_case(l)))
-                                .map(|v| v.to_lowercase())
-                                .collect();
-                            let mc_versions: Vec<String> = cf
-                                .game_versions
-                                .into_iter()
-                                .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
-                                .collect();
-                            let pf = ProjectFile {
-                                name: cf.display_name.clone(),
-                                mc_versions,
-                                loaders,
-                                date_published: cf.file_date,
-                                downloads: cf.download_count,
-                                size: cf.file_length,
-                                url: cf.download_url.clone(),
-                                platforms: vec![Platform::CurseForge],
-                                modrinth_version_id: None,
-                                modrinth_url: None,
-                                curseforge_file_id: Some(cf.id),
-                                curseforge_url: cf.download_url,
-                                curseforge_project_id: Some(i64::from(cf.id)),
-                                sha1: cf.sha1.clone(),
-                                modrinth_name: None,
-                                curseforge_name: Some(cf.display_name.clone()),
-                                dependencies: cf.dependencies,
-                            };
-                            // Merge across platforms by hash (or size+name when
-                            // sha1 is missing on one side).
-                            if let Some(existing) = all_files
-                                .iter_mut()
-                                .find(|e: &&mut ProjectFile| e.same_file_as(&pf))
-                            {
-                                if !existing.platforms.contains(&Platform::CurseForge) {
-                                    existing.platforms.push(Platform::CurseForge);
-                                }
-                                if pf.downloads > existing.downloads {
-                                    existing.downloads = pf.downloads;
-                                }
-                                if pf.curseforge_file_id.is_some() {
-                                    existing.curseforge_file_id = pf.curseforge_file_id;
-                                    existing.curseforge_url = pf.curseforge_url.clone();
-                                }
-                                if pf.curseforge_name.is_some() {
-                                    existing.curseforge_name = pf.curseforge_name.clone();
-                                }
-                                if pf.url.is_some() {
-                                    existing.url = pf.url.clone();
-                                }
-                            } else {
-                                all_files.push(pf);
+        if let Some(id) = curseforge_id
+            && let Some(ref key) = api_key
+        {
+            let client = CurseForgeClient::new(key);
+            match client.get_files(id, None, None).await {
+                Ok(files) => {
+                    for cf in files {
+                        let known: Vec<&str> = filters::LOADERS.to_vec();
+                        let loaders: Vec<String> = cf
+                            .game_versions
+                            .iter()
+                            .filter(|v| known.iter().any(|l| v.eq_ignore_ascii_case(l)))
+                            .map(|v| v.to_lowercase())
+                            .collect();
+                        let mc_versions: Vec<String> = cf
+                            .game_versions
+                            .into_iter()
+                            .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
+                            .collect();
+                        let pf = ProjectFile {
+                            name: cf.display_name.clone(),
+                            mc_versions,
+                            loaders,
+                            date_published: cf.file_date,
+                            downloads: cf.download_count,
+                            size: cf.file_length,
+                            url: cf.download_url.clone(),
+                            platforms: vec![Platform::CurseForge],
+                            modrinth_version_id: None,
+                            modrinth_url: None,
+                            curseforge_file_id: Some(cf.id),
+                            curseforge_url: cf.download_url,
+                            curseforge_project_id: Some(i64::from(id)),
+                            sha1: cf.sha1.clone(),
+                            modrinth_name: None,
+                            curseforge_name: Some(cf.display_name.clone()),
+                            dependencies: cf.dependencies,
+                        };
+                        // Merge across platforms by hash (or size+name when
+                        // sha1 is missing on one side).
+                        if let Some(existing) = all_files
+                            .iter_mut()
+                            .find(|e: &&mut ProjectFile| e.same_file_as(&pf))
+                        {
+                            if !existing.platforms.contains(&Platform::CurseForge) {
+                                existing.platforms.push(Platform::CurseForge);
                             }
+                            if pf.downloads > existing.downloads {
+                                existing.downloads = pf.downloads;
+                            }
+                            if pf.curseforge_file_id.is_some() {
+                                existing.curseforge_file_id = pf.curseforge_file_id;
+                                existing.curseforge_url.clone_from(&pf.curseforge_url);
+                            }
+                            if pf.curseforge_name.is_some() {
+                                existing.curseforge_name.clone_from(&pf.curseforge_name);
+                            }
+                            if pf.url.is_some() {
+                                existing.url.clone_from(&pf.url);
+                            }
+                        } else {
+                            all_files.push(pf);
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!("CurseForge: {e}"))).await;
-                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error(format!("CurseForge: {e}"))).await;
                 }
             }
         }
@@ -594,9 +598,15 @@ async fn start_file_fetch(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::S
     });
 }
 
+/// Terminal coordinates are u16; cursor/line indexes can't realistically
+/// overflow that, so clamp instead of panicking on `try_from`.
+fn u16c(v: usize) -> u16 {
+    u16::try_from(v).unwrap_or(u16::MAX)
+}
+
 // ── Search Screen Rendering ────────────────────────────────
 
-pub(crate) fn render_search_screen(frame: &mut Frame, app: &App) {
+pub fn render_search_screen(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let constraints = vec![
         Constraint::Length(3),
@@ -633,7 +643,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     };
     let mut parts = vec![
         Span::styled(
-            format!(" easypacker{} ", indicator),
+            format!(" easypacker{indicator} "),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -683,7 +693,7 @@ fn render_search(frame: &mut Frame, area: Rect, app: &App) {
         );
     frame.render_widget(input, area);
     if focused {
-        let x = area.x + 1 + app.cursor_pos as u16;
+        let x = area.x + 1 + u16c(app.cursor_pos);
         let y = area.y + 1;
         frame.set_cursor_position((x, y));
     }
@@ -859,6 +869,8 @@ fn render_error(frame: &mut Frame, area: Rect, msg: &str) {
     frame.render_widget(paragraph, area);
 }
 
+/// Renders one result card per loop iteration; long but a single scan.
+#[allow(clippy::too_many_lines)]
 fn render_results(frame: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Results;
     let border_style = if focused {
@@ -896,10 +908,10 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
             r.cross.modrinth_url.is_some() || r.cross.curseforge_url.is_some() || r.url.is_some();
         let item_lines: usize = if selected && has_url { 4 } else { 3 };
         let y = current_y;
-        current_y += item_lines as u16;
+        current_y += u16c(item_lines);
 
         let icon_area = Rect::new(inner.x + 1, y, 6, 2);
-        if let Some(ref proto) = app.proto_cache.get(idx).and_then(|p| p.as_ref()) {
+        if let Some(proto) = app.proto_cache.get(idx).and_then(|p| p.as_ref()) {
             frame.render_widget(Image::new(proto), icon_area);
         }
 
@@ -907,7 +919,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         let text_w = inner.width.saturating_sub(9);
         // In-pack = present in the manifest OR pinned in the lockfile (so
         // auto-resolved deps like patchouli show as selected too).
-        let in_manifest = app.project.as_ref().map_or(false, |m| {
+        let in_manifest = app.project.as_ref().is_some_and(|m| {
             m.contains(
                 &r.project_type,
                 r.cross.modrinth_slug.as_deref(),
@@ -918,11 +930,10 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
             .cross
             .modrinth_slug
             .as_deref()
-            .map_or(false, |s| app.lock_slugs.contains(s))
-            || r
-                .cross
+            .is_some_and(|s| app.lock_slugs.contains(s))
+            || r.cross
                 .curseforge_id
-                .map_or(false, |id| app.lock_cf_ids.contains(&i64::from(id)));
+                .is_some_and(|id| app.lock_cf_ids.contains(&i64::from(id)));
         let in_pack = in_manifest || in_lock;
 
         let sel_style = if selected {
@@ -932,7 +943,13 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             Style::default()
         };
-        let prefix = if selected { "▸ " } else if in_pack { "✓ " } else { "  " };
+        let prefix = if selected {
+            "▸ "
+        } else if in_pack {
+            "✓ "
+        } else {
+            "  "
+        };
         let license = r.license.as_deref().unwrap_or("-");
         let latest = r.latest_version.as_deref().unwrap_or("-");
         let loaders_str = if r.loaders.is_empty() {
@@ -977,13 +994,13 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
             sel_style.add_modifier(Modifier::BOLD),
         ));
         if !badges.is_empty() {
-            title_spans.push(Span::styled(
-                badges,
-                sel_style,
-            ));
+            title_spans.push(Span::styled(badges, sel_style));
         }
         title_spans.push(Span::raw("  "));
-        title_spans.push(Span::styled(format!("[{}]", icon_char), Style::default().fg(icon_color)));
+        title_spans.push(Span::styled(
+            format!("[{icon_char}]"),
+            Style::default().fg(icon_color),
+        ));
         title_spans.push(Span::raw("  "));
         title_spans.push(Span::styled(license, Style::default().fg(Color::Cyan)));
         title_spans.push(Span::raw("  "));
@@ -1014,13 +1031,13 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::Blue).underlined(),
                 )]));
             }
-            if url_lines.is_empty() {
-                if let Some(ref u) = r.url {
-                    url_lines.push(Line::from(vec![Span::styled(
-                        format!("   {u}"),
-                        Style::default().fg(Color::Blue).underlined(),
-                    )]));
-                }
+            if url_lines.is_empty()
+                && let Some(ref u) = r.url
+            {
+                url_lines.push(Line::from(vec![Span::styled(
+                    format!("   {u}"),
+                    Style::default().fg(Color::Blue).underlined(),
+                )]));
             }
         }
         let mut all_lines = vec![title_line, meta_line];
@@ -1028,7 +1045,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         while all_lines.len() < item_lines {
             all_lines.push(Line::from(""));
         }
-        let text_area = Rect::new(text_x, y, text_w, item_lines as u16);
+        let text_area = Rect::new(text_x, y, text_w, u16c(item_lines));
         frame.render_widget(
             Paragraph::new(all_lines).wrap(Wrap { trim: false }),
             text_area,
@@ -1059,7 +1076,10 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
 }
 
-pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
+/// Renders the file-browse list + badges; a single pass over the file rows.
+#[allow(clippy::too_many_lines)]
+pub fn render_file_browse(frame: &mut Frame, app: &App) {
+    use ratatui::text::Span as TitleSpan;
     let area = frame.area();
     let Some(ref fb) = app.file_browse else {
         return;
@@ -1068,27 +1088,37 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
     // Determine which platforms the manifest spec actually links, so the
     // added row can show accurate [M]/[C] badges even after a reopen.
     let cwd = std::env::current_dir().unwrap_or_default();
-    let linked = project::Manifest::load(&cwd)
-        .ok()
-        .and_then(|m| {
-            m.spec_for(
-                &fb.project_type,
-                fb.modrinth_slug.as_deref(),
-                fb.curseforge_id.map(i64::from),
-            )
-            .map(|s| (s.has_modrinth(), s.has_curseforge()))
-        });
+    let linked = project::Manifest::load(&cwd).ok().and_then(|m| {
+        m.spec_for(
+            &fb.project_type,
+            fb.modrinth_slug.as_deref(),
+            fb.curseforge_id.map(i64::from),
+        )
+        .map(|s| (s.has_modrinth(), s.has_curseforge()))
+    });
     let (link_mr, link_cf) = linked.unwrap_or((false, false));
     let added = if fb.already_added || fb.added_index.is_some() {
         " [ALREADY IN MODPACK]"
     } else {
         ""
     };
-    use ratatui::text::Span as TitleSpan;
     let header = Line::from(vec![
-        TitleSpan::raw(format!(" {}{} — Esc:back  ↑↓:scroll  Enter:add/remove  ", fb.project_title, added)),
-        TitleSpan::styled("l:link other platform ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        TitleSpan::styled("d:dependencies ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        TitleSpan::raw(format!(
+            " {}{} — Esc:back  ↑↓:scroll  Enter:add/remove  ",
+            fb.project_title, added
+        )),
+        TitleSpan::styled(
+            "l:link other platform ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TitleSpan::styled(
+            "d:dependencies ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
         TitleSpan::raw(format!("  ({})", fb.files.len())),
     ]);
     let lines: Vec<Line> = fb
@@ -1101,19 +1131,16 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
             let is_sel = i == fb.selected;
             let is_added = fb.added_index.is_some_and(|idx| idx == i);
             let (prefix, bg) = if is_added {
-                (
-                    "✓ ",
-                    Style::default().bg(Color::Green).fg(Color::Black),
-                )
+                ("✓ ", Style::default().bg(Color::Green).fg(Color::Black))
             } else if is_sel {
-                (
-                    "▸ ",
-                    Style::default().bg(Color::Blue).fg(Color::White),
-                )
+                ("▸ ", Style::default().bg(Color::Blue).fg(Color::White))
             } else {
                 ("  ", Style::default())
             };
-            let mc = f.mc_versions.first().map(|s| s.as_str()).unwrap_or("-");
+            let mc = f
+                .mc_versions
+                .first()
+                .map_or("-", std::string::String::as_str);
             let loaders = f.loaders.join(", ");
             let date = &f.date_published[..f.date_published.len().min(10)];
             let dl = f.downloads;
@@ -1134,10 +1161,7 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
             .concat();
             Line::from(vec![
                 Span::styled(prefix, bg),
-                Span::styled(
-                    f.name.clone(),
-                    bg.add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(f.name.clone(), bg.add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  MC:{mc}"), bg),
                 Span::styled(
                     if loaders.is_empty() {
@@ -1166,9 +1190,9 @@ pub(crate) fn render_file_browse(frame: &mut Frame, app: &App) {
 }
 
 /// Full-screen overlay for the link-version popup.
-pub(crate) fn render_link_version(frame: &mut Frame, app: &App) {
-    let (Some(ref fb), Some(ref lv)) = (app.file_browse.as_ref(), app.link_version.as_ref())
-    else {
+#[allow(clippy::many_single_char_names)]
+pub fn render_link_version(frame: &mut Frame, app: &App) {
+    let (Some(fb), Some(lv)) = (app.file_browse.as_ref(), app.link_version.as_ref()) else {
         return;
     };
     let area = frame.area();
@@ -1189,20 +1213,27 @@ pub(crate) fn render_link_version(frame: &mut Frame, app: &App) {
         .added_index
         .and_then(|i| fb.files.get(i))
         .filter(|f| !f.platforms.contains(&lv.platform));
-    let title = match added {
-        Some(f) => format!(" Link {which} version for '{}' (Esc:back) ", f.name),
-        None => format!(" Link {which} version (Esc:back) "),
-    };
+    let title = added.map_or_else(
+        || format!(" Link {which} version (Esc:back) "),
+        |f| format!(" Link {which} version for '{}' (Esc:back) ", f.name),
+    );
 
     // Clear the popup area so file-browse rows don't bleed through.
     frame.render_widget(ratatui::widgets::Clear, popup);
 
     let border_style = Style::default().fg(Color::Yellow);
-    let block = Block::default().borders(Borders::ALL).title(title).border_style(border_style);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
     let inner = block.inner(popup);
     frame.render_widget(&block, popup);
 
-    let constraints = vec![Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)];
+    let constraints = vec![
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ];
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -1223,7 +1254,7 @@ pub(crate) fn render_link_version(frame: &mut Frame, app: &App) {
                 .border_style(Style::default().fg(Color::Yellow)),
         );
     frame.render_widget(q, chunks[0]);
-    let cx = chunks[0].x + 1 + lv.cursor as u16;
+    let cx = chunks[0].x + 1 + u16c(lv.cursor);
     let cy = chunks[0].y + 1;
     frame.set_cursor_position((cx.min(popup.right().saturating_sub(1)), cy));
 
@@ -1251,10 +1282,9 @@ pub(crate) fn render_link_version(frame: &mut Frame, app: &App) {
 }
 
 fn render_link_results(frame: &mut Frame, area: Rect, lv: &LinkVersionState) {
-    let block = Block::default().borders(Borders::ALL).title(format!(
-        " Results ({}) ",
-        lv.results.len()
-    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Results ({}) ", lv.results.len()));
     let inner = block.inner(area);
     frame.render_widget(&block, area);
     let rows = (inner.height as usize) / 2;
@@ -1281,7 +1311,7 @@ fn render_link_results(frame: &mut Frame, area: Rect, lv: &LinkVersionState) {
                 Span::raw("  "),
                 Span::styled(r.project_type.clone(), bg.fg(Color::Cyan)),
                 Span::raw("  "),
-                Span::styled(format!("{license}"), bg.fg(Color::Gray)),
+                Span::styled(license.to_string(), bg.fg(Color::Gray)),
                 Span::raw("  "),
                 Span::styled(format!("{downloads}↓"), bg.fg(Color::Green)),
             ])
@@ -1292,7 +1322,9 @@ fn render_link_results(frame: &mut Frame, area: Rect, lv: &LinkVersionState) {
 }
 
 fn render_link_files(frame: &mut Frame, area: Rect, fb: &FileBrowseState, lv: &LinkVersionState) {
-    let block = Block::default().borders(Borders::ALL).title(" Matching versions ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Matching versions ");
     let inner = block.inner(area);
     frame.render_widget(&block, area);
     let added_file = fb.added_index.and_then(|i| fb.files.get(i));
@@ -1312,7 +1344,10 @@ fn render_link_files(frame: &mut Frame, area: Rect, fb: &FileBrowseState, lv: &L
                 Style::default()
             };
             let prefix = if is_sel { "▸ " } else { "  " };
-            let mc = f.mc_versions.first().map(|s| s.as_str()).unwrap_or("-");
+            let mc = f
+                .mc_versions
+                .first()
+                .map_or("-", std::string::String::as_str);
             let loaders = f.loaders.join(", ");
             let date = &f.date_published[..f.date_published.len().min(10)];
             let mut spans = vec![
@@ -1324,7 +1359,10 @@ fn render_link_files(frame: &mut Frame, area: Rect, fb: &FileBrowseState, lv: &L
                 spans.push(Span::styled(format!("  {loaders}"), bg.fg(Color::Magenta)));
             }
             spans.push(Span::styled(format!("  {date}"), bg.fg(Color::DarkGray)));
-            spans.push(Span::styled(format!("  {}↓", f.downloads), bg.fg(Color::Green)));
+            spans.push(Span::styled(
+                format!("  {}↓", f.downloads),
+                bg.fg(Color::Green),
+            ));
             if let Some(a) = added_file
                 && !a.same_file_as(f)
             {
@@ -1333,7 +1371,7 @@ fn render_link_files(frame: &mut Frame, area: Rect, fb: &FileBrowseState, lv: &L
             Line::from(spans)
         })
         .collect();
-    let n = lines.len().max(1) as u16;
+    let n = u16c(lines.len().max(1));
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
         Rect::new(inner.x, inner.y, inner.width, n),
@@ -1341,9 +1379,9 @@ fn render_link_files(frame: &mut Frame, area: Rect, fb: &FileBrowseState, lv: &L
 }
 
 /// Kick off a real API search for the missing platform in the link popup.
-pub(crate) async fn start_link_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+pub fn start_link_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
     let (query, platform) = match app.link_version.as_ref() {
-        Some(lv) => (lv.query.trim().to_string(), lv.platform.clone()),
+        Some(lv) => (lv.query.trim().to_string(), lv.platform),
         None => return,
     };
     if query.is_empty() {
@@ -1359,9 +1397,8 @@ pub(crate) async fn start_link_search(app: &mut App, cfg: &Config, tx: &tokio::s
     let pt = app
         .file_browse
         .as_ref()
-        .map(|fb| fb.project_type.clone())
-        .unwrap_or_else(|| "mod".to_string());
-    let api_key = cfg.get_api_key(None).ok();
+        .map_or_else(|| "mod".to_string(), |fb| fb.project_type.clone());
+    let api_key = cfg.get_api_key(None, None).ok();
     let tx = tx.clone();
     tokio::spawn(async move {
         let filters = SearchFilters {
@@ -1392,18 +1429,19 @@ pub(crate) async fn start_link_search(app: &mut App, cfg: &Config, tx: &tokio::s
 }
 
 /// Fetch versions for a project picked in the link popup.
-pub(crate) async fn start_link_file_fetch(
+#[allow(clippy::too_many_lines)]
+pub fn start_link_file_fetch(
     app: &mut App,
     cfg: &Config,
     tx: &tokio::sync::mpsc::Sender<AppEvent>,
 ) {
-    let platform = app.link_version.as_ref().map(|lv| lv.platform.clone()).unwrap();
+    let platform = app.link_version.as_ref().map(|lv| lv.platform).unwrap();
     let Some(picked) = app.link_version.as_ref().and_then(|lv| lv.picked.clone()) else {
         return;
     };
     let modrinth_slug = picked.modrinth_slug.clone();
     let curseforge_id = picked.curseforge_id;
-    let api_key = cfg.get_api_key(None).ok();
+    let api_key = cfg.get_api_key(None, None).ok();
     // Mirror normal file-fetch filters: project MC version + loader (mods only).
     let version_filter = app
         .project
@@ -1413,10 +1451,12 @@ pub(crate) async fn start_link_file_fetch(
     let project_type = app
         .file_browse
         .as_ref()
-        .map(|fb| fb.project_type.clone())
-        .unwrap_or_else(|| "mod".to_string());
+        .map_or_else(|| "mod".to_string(), |fb| fb.project_type.clone());
     let loader_filter = if project_type == "mod" {
-        app.project.as_ref().map(|p| p.project.loader.clone()).unwrap_or_default()
+        app.project
+            .as_ref()
+            .map(|p| p.project.loader.clone())
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -1431,29 +1471,28 @@ pub(crate) async fn start_link_file_fetch(
         let mut files: Vec<ProjectFile> = Vec::new();
         if platform == Platform::Modrinth
             && let Some(slug) = modrinth_slug.as_deref()
+            && let Ok(versions) = ModrinthClient::get_versions(slug, None, None).await
         {
-            if let Ok(versions) = ModrinthClient::get_versions(slug, None, None).await {
-                for mv in versions {
-                    files.push(ProjectFile {
-                        name: mv.name.clone(),
-                        mc_versions: mv.game_versions,
-                        loaders: mv.loaders,
-                        date_published: mv.date_published,
-                        downloads: mv.downloads,
-                        size: mv.size,
-                        url: mv.url.clone(),
-                        platforms: vec![Platform::Modrinth],
-                        modrinth_version_id: Some(mv.id),
-                        modrinth_url: mv.url,
-                        curseforge_file_id: None,
-                        curseforge_url: None,
-                        curseforge_project_id: None,
-                        sha1: mv.sha1.clone(),
-                        modrinth_name: Some(mv.name.clone()),
-                        curseforge_name: None,
-                        dependencies: mv.dependencies,
-                    });
-                }
+            for mv in versions {
+                files.push(ProjectFile {
+                    name: mv.name.clone(),
+                    mc_versions: mv.game_versions,
+                    loaders: mv.loaders,
+                    date_published: mv.date_published,
+                    downloads: mv.downloads,
+                    size: mv.size,
+                    url: mv.url.clone(),
+                    platforms: vec![Platform::Modrinth],
+                    modrinth_version_id: Some(mv.id),
+                    modrinth_url: mv.url,
+                    curseforge_file_id: None,
+                    curseforge_url: None,
+                    curseforge_project_id: None,
+                    sha1: mv.sha1.clone(),
+                    modrinth_name: Some(mv.name.clone()),
+                    curseforge_name: None,
+                    dependencies: mv.dependencies,
+                });
             }
         }
         if platform == Platform::CurseForge
@@ -1488,7 +1527,7 @@ pub(crate) async fn start_link_file_fetch(
                         modrinth_url: None,
                         curseforge_file_id: Some(cf.id),
                         curseforge_url: cf.download_url,
-                        curseforge_project_id: Some(i64::from(cf.id)),
+                        curseforge_project_id: Some(i64::from(id)),
                         sha1: cf.sha1.clone(),
                         modrinth_name: None,
                         curseforge_name: Some(cf.display_name.clone()),
@@ -1501,10 +1540,10 @@ pub(crate) async fn start_link_file_fetch(
         let filtered: Vec<ProjectFile> = files
             .into_iter()
             .filter(|f| {
-                let mc_ok = version_filter.is_empty()
-                    || f.mc_versions.iter().any(|v| v == &version_filter);
-                let loader_ok = loader_filter.is_empty()
-                    || f.loaders.iter().any(|l| l == &loader_filter);
+                let mc_ok =
+                    version_filter.is_empty() || f.mc_versions.iter().any(|v| v == &version_filter);
+                let loader_ok =
+                    loader_filter.is_empty() || f.loaders.iter().any(|l| l == &loader_filter);
                 mc_ok && loader_ok
             })
             .collect();
@@ -1514,11 +1553,13 @@ pub(crate) async fn start_link_file_fetch(
 
 // ── Dependency popup ───────────────────────────────────────
 
-use crate::api::types::{Dependency, DepKind};
+use crate::api::types::{DepKind, Dependency};
 
 /// Fetch titles + available versions for each dependency of the selected file,
 /// filtered to the project's mc/loader, then send a `DepsLoaded` event.
-pub(crate) async fn start_dependency_fetch(
+/// Spawns the API work; the outer function has no awaits of its own.
+#[allow(clippy::too_many_lines)]
+pub fn start_dependency_fetch(
     app: &mut App,
     cfg: &Config,
     tx: &tokio::sync::mpsc::Sender<AppEvent>,
@@ -1572,12 +1613,13 @@ pub(crate) async fn start_dependency_fetch(
     } else {
         String::new()
     };
-    let want_cf = app
-        .project
-        .as_ref()
-        .map(|p| p.project.platforms.iter().any(|t| t.eq_ignore_ascii_case("curseforge")))
-        .unwrap_or(false);
-    let api_key = cfg.get_api_key(None).ok();
+    let want_cf = app.project.as_ref().is_some_and(|p| {
+        p.project
+            .platforms
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("curseforge"))
+    });
+    let api_key = cfg.get_api_key(None, None).ok();
     let tx = tx.clone();
     tokio::spawn(async move {
         let mut rows: Vec<DepRow> = Vec::new();
@@ -1597,7 +1639,11 @@ pub(crate) async fn start_dependency_fetch(
                     if let Ok(vs) = ModrinthClient::get_versions(
                         &d.project_id,
                         if mc.is_empty() { None } else { Some(&mc) },
-                        if loader.is_empty() { None } else { Some(&loader) },
+                        if loader.is_empty() {
+                            None
+                        } else {
+                            Some(&loader)
+                        },
                     )
                     .await
                     {
@@ -1616,22 +1662,19 @@ pub(crate) async fn start_dependency_fetch(
                             curseforge_url: None,
                             curseforge_project_id: None,
                             sha1: v.sha1.clone(),
-                            modrinth_name: Some(v.name.clone()),
+                            modrinth_name: Some(v.name),
                             curseforge_name: None,
                             dependencies: Vec::new(),
                         }));
                     }
                     // Counterpart: curseforge, via the resolved slug.
-                    if want_cf
-                        && let Some(ref key) = api_key
-                    {
+                    if want_cf && let Some(ref key) = api_key {
                         let client = CurseForgeClient::new(key);
                         if let Ok(Some((mod_id, _))) =
                             client.find_by_slug(&resolved_id, Some(6)).await
+                            && let Ok(fs) = client.get_files(mod_id, None, None).await
                         {
-                            if let Ok(fs) = client.get_files(mod_id, None, None).await {
-                                merge_cf_files(&mut versions, fs, &mc, Some(i64::from(mod_id)));
-                            }
+                            merge_cf_files(&mut versions, fs, &mc, Some(i64::from(mod_id)));
                         }
                     }
                 }
@@ -1644,43 +1687,46 @@ pub(crate) async fn start_dependency_fetch(
                     };
                     let client = CurseForgeClient::new(key);
                     if let Ok((_, name, slug)) = client.get_mod(mod_id).await {
-                        resolved_id = slug.clone();
+                        resolved_id.clone_from(&slug);
                         title = name;
                     }
                     if let Ok(fs) = client.get_files(mod_id, None, None).await {
                         merge_cf_files(&mut versions, fs, &mc, Some(i64::from(mod_id)));
                     }
                     // Counterpart: modrinth, via the resolved slug.
-                    if ModrinthClient::get_project(&resolved_id).await.is_ok() {
-                        if let Ok(vs) = ModrinthClient::get_versions(
+                    if ModrinthClient::get_project(&resolved_id).await.is_ok()
+                        && let Ok(vs) = ModrinthClient::get_versions(
                             &resolved_id,
                             if mc.is_empty() { None } else { Some(&mc) },
-                            if loader.is_empty() { None } else { Some(&loader) },
+                            if loader.is_empty() {
+                                None
+                            } else {
+                                Some(&loader)
+                            },
                         )
                         .await
-                        {
-                            for v in vs {
-                                let pf = ProjectFile {
-                                    name: v.name.clone(),
-                                    mc_versions: v.game_versions,
-                                    loaders: v.loaders,
-                                    date_published: v.date_published,
-                                    downloads: v.downloads,
-                                    size: v.size,
-                                    url: v.url.clone(),
-                                    platforms: vec![Platform::Modrinth],
-                                    modrinth_version_id: Some(v.id),
-                                    modrinth_url: v.url,
-                                    curseforge_file_id: None,
-                                    curseforge_url: None,
-                                    curseforge_project_id: None,
-                                    sha1: v.sha1.clone(),
-                                    modrinth_name: Some(v.name.clone()),
-                                    curseforge_name: None,
-                                    dependencies: Vec::new(),
-                                };
-                                merge_project_file(&mut versions, pf);
-                            }
+                    {
+                        for v in vs {
+                            let pf = ProjectFile {
+                                name: v.name.clone(),
+                                mc_versions: v.game_versions,
+                                loaders: v.loaders,
+                                date_published: v.date_published,
+                                downloads: v.downloads,
+                                size: v.size,
+                                url: v.url.clone(),
+                                platforms: vec![Platform::Modrinth],
+                                modrinth_version_id: Some(v.id),
+                                modrinth_url: v.url,
+                                curseforge_file_id: None,
+                                curseforge_url: None,
+                                curseforge_project_id: None,
+                                sha1: v.sha1.clone(),
+                                modrinth_name: Some(v.name.clone()),
+                                curseforge_name: None,
+                                dependencies: Vec::new(),
+                            };
+                            merge_project_file(&mut versions, pf);
                         }
                     }
                 }
@@ -1688,7 +1734,7 @@ pub(crate) async fn start_dependency_fetch(
             rows.push(DepRow {
                 id: resolved_id,
                 project_id: d.project_id.clone(),
-                platform: d.platform.clone(),
+                platform: d.platform,
                 title,
                 optional: d.kind == DepKind::Optional,
                 enabled: d.kind != DepKind::Optional,
@@ -1703,7 +1749,7 @@ pub(crate) async fn start_dependency_fetch(
         // latest.
         let cwd = std::env::current_dir().unwrap_or_default();
         let manifest = crate::project::Manifest::load(&cwd).ok();
-        for row in rows.iter_mut() {
+        for row in &mut rows {
             let spec = manifest.as_ref().and_then(|m| m.cat("mod").get(&row.id));
             // A dep present in the manifest was previously enabled/pinned:
             // reflect that state. Match by either platform's own version name.
@@ -1711,8 +1757,12 @@ pub(crate) async fn start_dependency_fetch(
                 let mr_pin = spec.version_for(true);
                 let cf_pin = spec.version_for(false);
                 if let Some(pf) = row.versions.iter().find(|f| {
-                    f.modrinth_name.as_deref().is_some_and(|n| Some(n) == mr_pin.as_deref())
-                        || f.curseforge_name.as_deref().is_some_and(|n| Some(n) == cf_pin.as_deref())
+                    f.modrinth_name
+                        .as_deref()
+                        .is_some_and(|n| Some(n) == mr_pin.as_deref())
+                        || f.curseforge_name
+                            .as_deref()
+                            .is_some_and(|n| Some(n) == cf_pin.as_deref())
                 }) {
                     row.version = Some(pf.name.clone());
                 }
@@ -1729,11 +1779,11 @@ fn version_matches(versions: &[String], want: &str) -> bool {
     want.is_empty() || versions.iter().any(|v| v == want)
 }
 
-/// CurseForge display names are often the raw archive filename (e.g.
+/// `CurseForge` display names are often the raw archive filename (e.g.
 /// "iceandfire-2.1-beta.1.jar") rather than a real version name. When that's
 /// the case, prefer the modrinth version name — they're the same file (same
 /// sha1), so the modrinth name is the readable version.
-pub(crate) fn readable_cf_name(cf_name: &str, mr_name: Option<&str>) -> String {
+pub fn readable_cf_name(cf_name: &str, mr_name: Option<&str>) -> String {
     let lower = cf_name.to_lowercase();
     let is_filename = [".jar", ".zip", ".rar", ".7z", ".litemod", ".mcpack"]
         .iter()
@@ -1800,28 +1850,30 @@ fn merge_project_file(versions: &mut Vec<ProjectFile>, pf: ProjectFile) {
     if let Some(existing) = versions.iter_mut().find(|e| e.same_file_as(&pf)) {
         for p in &pf.platforms {
             if !existing.platforms.contains(p) {
-                existing.platforms.push(p.clone());
+                existing.platforms.push(*p);
             }
         }
         if pf.modrinth_version_id.is_some() {
-            existing.modrinth_version_id = pf.modrinth_version_id.clone();
-            existing.modrinth_url = pf.modrinth_url.clone();
+            existing
+                .modrinth_version_id
+                .clone_from(&pf.modrinth_version_id);
+            existing.modrinth_url.clone_from(&pf.modrinth_url);
         }
         if pf.curseforge_file_id.is_some() {
             existing.curseforge_file_id = pf.curseforge_file_id;
-            existing.curseforge_url = pf.curseforge_url.clone();
+            existing.curseforge_url.clone_from(&pf.curseforge_url);
         }
         if pf.url.is_some() {
-            existing.url = pf.url.clone();
+            existing.url.clone_from(&pf.url);
         }
         if pf.sha1.is_some() && existing.sha1.is_none() {
-            existing.sha1 = pf.sha1.clone();
+            existing.sha1.clone_from(&pf.sha1);
         }
         if pf.modrinth_name.is_some() && existing.modrinth_name.is_none() {
-            existing.modrinth_name = pf.modrinth_name.clone();
+            existing.modrinth_name.clone_from(&pf.modrinth_name);
         }
         if pf.curseforge_name.is_some() && existing.curseforge_name.is_none() {
-            existing.curseforge_name = pf.curseforge_name.clone();
+            existing.curseforge_name.clone_from(&pf.curseforge_name);
         }
         if pf.curseforge_project_id.is_some() && existing.curseforge_project_id.is_none() {
             existing.curseforge_project_id = pf.curseforge_project_id;
@@ -1832,7 +1884,8 @@ fn merge_project_file(versions: &mut Vec<ProjectFile>, pf: ProjectFile) {
 }
 
 /// Full-screen overlay popup listing required + optional dependencies.
-pub(crate) fn render_dependency_popup(frame: &mut Frame, app: &App) {
+#[allow(clippy::too_many_lines)]
+pub fn render_dependency_popup(frame: &mut Frame, app: &App) {
     let Some(ref dep) = app.dependencies else {
         return;
     };
@@ -1871,13 +1924,12 @@ pub(crate) fn render_dependency_popup(frame: &mut Frame, app: &App) {
             "Required dependencies are pinned automatically; ",
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled(
-            "optional ones ",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("optional ones ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "need enabling",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::UNDERLINED),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
         ),
         Span::styled(".", Style::default().fg(Color::DarkGray)),
     ]);
@@ -1899,21 +1951,38 @@ pub(crate) fn render_dependency_popup(frame: &mut Frame, app: &App) {
         };
         let prefix = if is_sel { "▸ " } else { "  " };
         let kind_label = if row.optional {
-            Span::styled("[opt] ", bg.fg(if is_sel { Color::Cyan } else { Color::Magenta }))
+            Span::styled(
+                "[opt] ",
+                bg.fg(if is_sel { Color::Cyan } else { Color::Magenta }),
+            )
         } else {
-            Span::styled("[req] ", bg.fg(if is_sel { Color::Green } else { Color::DarkGray }))
+            Span::styled(
+                "[req] ",
+                bg.fg(if is_sel {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                }),
+            )
         };
         let state_mark = if row.optional {
             Span::styled(
                 if row.enabled { "◉ " } else { "○ " },
-                bg.fg(if row.enabled { Color::Green } else { Color::DarkGray }),
+                bg.fg(if row.enabled {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                }),
             )
         } else {
             Span::styled("● ", bg.fg(Color::Green))
         };
         let name_span = Span::styled(row.title.clone(), bg.add_modifier(Modifier::BOLD));
         let ver_label = Span::styled(
-            format!("  {}", row.version.clone().unwrap_or_else(|| "default".into())),
+            format!(
+                "  {}",
+                row.version.clone().unwrap_or_else(|| "default".into())
+            ),
             bg.fg(Color::DarkGray),
         );
         lines.push(Line::from(vec![
@@ -1930,14 +1999,16 @@ pub(crate) fn render_dependency_popup(frame: &mut Frame, app: &App) {
     }
 
     let list_area = if dep.version_picker.is_some() {
-        Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(8))
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(8),
+        )
     } else {
         inner
     };
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        list_area,
-    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), list_area);
 
     // Version picker sub-popup (bottom-right), over the list. Renders the
     // dep's versions like a normal file-browse list.
@@ -1945,7 +2016,9 @@ pub(crate) fn render_dependency_popup(frame: &mut Frame, app: &App) {
         let row = &dep.rows[vp.row];
         let title = format!(" Versions for {} (Enter:pick, Esc:back) ", row.title);
         let pw = (inner.width * 3 / 4).max(50);
-        let ph = (inner.height * 2 / 3).max(10).min(inner.height.saturating_sub(2));
+        let ph = (inner.height * 2 / 3)
+            .max(10)
+            .min(inner.height.saturating_sub(2));
         let px = inner.x + (inner.width.saturating_sub(pw)) / 2;
         let py = inner.y + (inner.height.saturating_sub(ph)) / 2;
         let parea = Rect::new(px, py, pw, ph);
@@ -1976,7 +2049,10 @@ pub(crate) fn render_dependency_popup(frame: &mut Frame, app: &App) {
                 continue;
             }
             if let Some(f) = row.versions.get(i - 1) {
-                let mc = f.mc_versions.first().map(|s| s.as_str()).unwrap_or("-");
+                let mc = f
+                    .mc_versions
+                    .first()
+                    .map_or("-", std::string::String::as_str);
                 let loaders = f.loaders.join(", ");
                 let date = &f.date_published[..f.date_published.len().min(10)];
                 let mut spans = vec![
@@ -1988,13 +2064,13 @@ pub(crate) fn render_dependency_popup(frame: &mut Frame, app: &App) {
                     spans.push(Span::styled(format!("  {loaders}"), bg.fg(Color::Magenta)));
                 }
                 spans.push(Span::styled(format!("  {date}"), bg.fg(Color::DarkGray)));
-                spans.push(Span::styled(format!("  {}↓", f.downloads), bg.fg(Color::Green)));
+                spans.push(Span::styled(
+                    format!("  {}↓", f.downloads),
+                    bg.fg(Color::Green),
+                ));
                 vlines.push(Line::from(spans));
             }
         }
-        frame.render_widget(
-            Paragraph::new(vlines).wrap(Wrap { trim: false }),
-            pinner,
-        );
+        frame.render_widget(Paragraph::new(vlines).wrap(Wrap { trim: false }), pinner);
     }
 }

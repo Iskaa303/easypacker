@@ -1,4 +1,4 @@
-use super::types::{CrossPlatform, Dependency, DepKind, Platform, SearchFilters, SearchResult};
+use super::types::{CrossPlatform, DepKind, Dependency, Platform, SearchFilters, SearchResult};
 use color_eyre::eyre::Result;
 use serde::Deserialize;
 use std::time::Duration;
@@ -146,6 +146,9 @@ impl CurseForgeClient {
         Self { client }
     }
 
+    /// Search for mods matching `filters`. The response mapping is long but
+    /// linear (fields -> `SearchResult`); no stage is reusable on its own.
+    #[allow(clippy::too_many_lines)]
     pub async fn search(&self, filters: &SearchFilters) -> Result<Vec<SearchResult>> {
         let mut params: Vec<(&str, String)> = vec![
             ("gameId", MINECRAFT_GAME_ID.to_string()),
@@ -160,19 +163,19 @@ impl CurseForgeClient {
         if let Some(ref v) = filters.version {
             params.push(("gameVersion", v.clone()));
         }
-        if let Some(ref l) = filters.loader {
-            if let Some(loader_id) = loader_id(l) {
-                params.push(("modLoaderType", loader_id.to_string()));
-            }
+        if let Some(ref l) = filters.loader
+            && let Some(loader_id) = loader_id(l)
+        {
+            params.push(("modLoaderType", loader_id.to_string()));
         }
-        if let Some(ref pt) = filters.project_type {
-            if let Some(cid) = project_type_to_class_id(pt) {
-                params.push(("classId", cid.to_string()));
-            }
+        if let Some(ref pt) = filters.project_type
+            && let Some(cid) = project_type_to_class_id(pt)
+        {
+            params.push(("classId", cid.to_string()));
         }
         let response = self
             .client
-            .get(format!("{}/mods/search", BASE))
+            .get(format!("{BASE}/mods/search"))
             .query(&params)
             .send()
             .await?;
@@ -217,12 +220,11 @@ impl CurseForgeClient {
                         .map(|n| n.split('-').next().unwrap_or(n).to_lowercase())
                 })
                 .collect();
-            if loaders.is_empty() {
-                if let Some(id) = latest_file.and_then(|f| f.mod_loader) {
-                    if let Some(name) = mod_loader_id_to_name(id) {
-                        loaders.push(name.into());
-                    }
-                }
+            if loaders.is_empty()
+                && let Some(id) = latest_file.and_then(|f| f.mod_loader)
+                && let Some(name) = mod_loader_id_to_name(id)
+            {
+                loaders.push(name.into());
             }
             results.push(SearchResult {
                 title: m.name,
@@ -231,10 +233,9 @@ impl CurseForgeClient {
                 downloads: m.downloads,
                 follows: 0,
                 platform: Platform::CurseForge,
-                url: m.links.and_then(|l| l.website_url).or(Some(format!(
-                    "https://www.curseforge.com/minecraft/mc-mods/{}",
-                    m.slug
-                ))),
+                url: Some(m.links.and_then(|l| l.website_url).unwrap_or_else(|| {
+                    format!("https://www.curseforge.com/minecraft/mc-mods/{}", m.slug)
+                })),
                 icon_url: m.logo.and_then(|l| l.url),
                 project_type: project_type_from_class_id(m.class_id, &categories),
                 license: None,
@@ -248,7 +249,7 @@ impl CurseForgeClient {
                 },
             });
         }
-        results.sort_by(|a, b| b.downloads.cmp(&a.downloads));
+        results.sort_by_key(|b| std::cmp::Reverse(b.downloads));
         Ok(results)
     }
 
@@ -268,7 +269,7 @@ impl CurseForgeClient {
         }
         let resp: SearchResponse = self
             .client
-            .get(format!("{}/mods/search", BASE))
+            .get(format!("{BASE}/mods/search"))
             .query(&params)
             .send()
             .await?
@@ -288,14 +289,14 @@ impl CurseForgeClient {
         if let Some(gv) = game_version {
             params.push(("gameVersion", gv.to_owned()));
         }
-        if let Some(l) = loader {
-            if let Some(id) = loader_id(l) {
-                params.push(("modLoaderType", id.to_string()));
-            }
+        if let Some(l) = loader
+            && let Some(id) = loader_id(l)
+        {
+            params.push(("modLoaderType", id.to_string()));
         }
         let resp: FilesResponse = self
             .client
-            .get(format!("{}/mods/{}/files", BASE, mod_id))
+            .get(format!("{BASE}/mods/{mod_id}/files"))
             .query(&params)
             .send()
             .await?
@@ -353,7 +354,7 @@ impl CurseForgeClient {
         }
         let resp: ModResponse = self
             .client
-            .get(format!("{}/mods/{mod_id}", BASE))
+            .get(format!("{BASE}/mods/{mod_id}"))
             .send()
             .await?
             .error_for_status()?
@@ -376,7 +377,7 @@ fn project_type_from_class_id(class_id: Option<i32>, categories: &[String]) -> S
     }
 }
 
-pub(crate) fn project_type_to_class_id(pt: &str) -> Option<i32> {
+pub fn project_type_to_class_id(pt: &str) -> Option<i32> {
     match pt {
         "mod" => Some(6),
         "resourcepack" => Some(12),
@@ -396,7 +397,7 @@ fn loader_id(l: &str) -> Option<i32> {
     }
 }
 
-fn mod_loader_id_to_name(id: i32) -> Option<&'static str> {
+const fn mod_loader_id_to_name(id: i32) -> Option<&'static str> {
     match id {
         1 => Some("forge"),
         4 => Some("fabric"),

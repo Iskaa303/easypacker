@@ -1,13 +1,16 @@
 use crate::api::types::SearchResult;
 use crate::project;
-use crate::types::*;
+use crate::types::{
+    AppMode, BrowseState, DependencyState, ExportState, FileBrowseState, FiltersState, Focus,
+    LinkVersionState, Status,
+};
 use crate::ui;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use std::cell::Cell;
 use std::collections::HashSet;
 
-pub(crate) struct App {
+pub struct App {
     // Search state
     pub query: String,
     pub cursor_pos: usize,
@@ -34,7 +37,8 @@ pub(crate) struct App {
     pub file_browse: Option<FileBrowseState>,
     pub link_version: Option<LinkVersionState>,
     pub dependencies: Option<DependencyState>,
-    /// Modrinth slugs + CurseForge project ids present in the lockfile, so
+    pub export_state: Option<ExportState>,
+    /// Modrinth slugs + `CurseForge` project ids present in the lockfile, so
     /// search results can mark deps that are in the pack (lockfile-only).
     pub lock_slugs: HashSet<String>,
     pub lock_cf_ids: HashSet<i64>,

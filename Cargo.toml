@@ -3,6 +3,9 @@ name = "easypacker"
 version = "0.1.0"
 edition = "2024"
 description = "A simple TUI/CLI tool for creating Minecraft Modpacks."
+# tests/*.rs are #[path]-included unit-test modules (they test private
+# items); don't also compile them as standalone integration tests.
+autotests = false
 
 [profile.release]
 opt-level = 2
@@ -32,3 +35,4 @@ dirs = "6"
 ratatui-image = { version = "11", default-features = false }
 rpassword = "7"
 toml = "0.9"
+zip = { version = "2", default-features = false, features = ["deflate"] }

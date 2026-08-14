@@ -171,8 +171,14 @@ patchouli = { modrinth = { slug = "patchouli", version = "1.21.1-93" } }
     .unwrap();
     let out = m.render();
     // No sub-tables, no dependencies field.
-    assert!(!out.contains("[mods.iceandfire]"), "sub-table leaked:\n{out}");
-    assert!(!out.contains("dependencies"), "dependencies leaked into manifest:\n{out}");
+    assert!(
+        !out.contains("[mods.iceandfire]"),
+        "sub-table leaked:\n{out}"
+    );
+    assert!(
+        !out.contains("dependencies"),
+        "dependencies leaked into manifest:\n{out}"
+    );
     // round-trips.
     let m2: Manifest = toml::from_str(&out).unwrap();
     assert!(matches!(&m2.mods["patchouli"], ModSpec::Detailed(_)));
@@ -266,7 +272,10 @@ patchouli = { modrinth = { slug = "patchouli", version = "1.21.1-92-neoforge" },
     // Round-trips and each platform resolves its own version.
     let m2: Manifest = toml::from_str(&out).unwrap();
     let spec = &m2.mods["patchouli"];
-    assert_eq!(spec.version_for(true).as_deref(), Some("1.21.1-92-neoforge"));
+    assert_eq!(
+        spec.version_for(true).as_deref(),
+        Some("1.21.1-92-neoforge")
+    );
     assert_eq!(
         spec.version_for(false).as_deref(),
         Some("Patchouli-1.21.1-92-NEOFORGE.jar")

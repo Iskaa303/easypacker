@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Platform {
     Modrinth,
     CurseForge,
@@ -12,7 +12,7 @@ pub enum DepKind {
 }
 
 /// A dependency declared by a version/file. `project_id` is the Modrinth
-/// project id OR the CurseForge modId (as a string); `version_id` is the
+/// project id OR the `CurseForge` modId (as a string); `version_id` is the
 /// specific version/file id the parent requires, when it pins one.
 #[derive(Debug, Clone)]
 pub struct Dependency {
@@ -23,7 +23,7 @@ pub struct Dependency {
     pub platform: Platform,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CrossPlatform {
     pub curseforge_id: Option<i32>,
     pub modrinth_slug: Option<String>,
@@ -74,7 +74,7 @@ pub struct ProjectFile {
     pub modrinth_url: Option<String>,
     pub curseforge_file_id: Option<i32>,
     pub curseforge_url: Option<String>,
-    /// CurseForge project id (modId) — needed to write a valid manifest
+    /// `CurseForge` project id (modId) — needed to write a valid manifest
     /// entry when the dep was declared on modrinth.
     pub curseforge_project_id: Option<i64>,
     /// sha1 of the file, present on both platforms — used to treat two files
@@ -91,16 +91,10 @@ impl ProjectFile {
     /// True if this file is the same release as `other` on a different
     /// platform. Compared by sha1 when both sides have it (names may differ
     /// between modrinth and curseforge); falls back to size+name.
-    pub fn same_file_as(&self, other: &ProjectFile) -> bool {
+    pub fn same_file_as(&self, other: &Self) -> bool {
         match (&self.sha1, &other.sha1) {
             (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-            _ => {
-                self.size == other.size
-                    && self
-                        .name
-                        .to_lowercase()
-                        == other.name.to_lowercase()
-            }
+            _ => self.size == other.size && self.name.to_lowercase() == other.name.to_lowercase(),
         }
     }
 }

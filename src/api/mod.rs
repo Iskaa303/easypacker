@@ -6,6 +6,7 @@ pub mod types;
 use crate::cli::Cli;
 use crate::config::Config;
 use color_eyre::eyre::Result;
+use std::io::Write;
 
 pub use curseforge::CurseForgeClient;
 pub use curseforge::CurseForgeFileInfo;
@@ -24,7 +25,7 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
         query: args.query.clone().unwrap_or_default(),
         version: args.version.clone(),
         loader: args.loader.clone(),
-        project_type: args.r#type.clone().or(Some("mod".into())),
+        project_type: Some(args.r#type.clone().unwrap_or_else(|| "mod".into())),
         sort: args.sort.clone(),
         limit: args.limit,
         offset: args.offset,
@@ -32,13 +33,13 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
 
     let results = match platform {
         Platform::Modrinth => ModrinthClient::search(&filters).await?,
-        Platform::CurseForge => match cfg.get_api_key(args.api_key.as_deref()) {
-            Ok(key) => CurseForgeClient::new(&key).search(&filters).await?,
-            Err(_) => {
+        Platform::CurseForge => {
+            if let Ok(key) = cfg.get_api_key(args.api_key.as_deref(), None) {
+                CurseForgeClient::new(&key).search(&filters).await?
+            } else {
                 eprintln!("CurseForge API key needed.");
                 eprintln!("Get a free key at: https://console.curseforge.com/");
                 eprint!("Paste your API key: ");
-                use std::io::Write;
                 std::io::stderr().flush().ok();
                 let key = rpassword::read_password()?;
                 if key.is_empty() {
@@ -53,7 +54,7 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
                 }
                 CurseForgeClient::new(&key).search(&filters).await?
             }
-        },
+        }
     };
     let results: Vec<_> = results
         .into_iter()
@@ -61,8 +62,7 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
             let t = r.project_type.to_lowercase();
             let pt = filters.project_type.as_deref().unwrap_or("mod");
             // Keep only results matching the user's chosen type (mandatory single-select)
-            let allowed = pt.split(", ").map(|s| s.trim()).collect::<Vec<_>>();
-            allowed.contains(&t.as_str())
+            pt.split(", ").map(str::trim).any(|a| a == t.as_str())
         })
         .collect();
 
@@ -77,10 +77,7 @@ pub async fn run_cli(args: &Cli, cfg: &Config) -> Result<()> {
         };
         println!("{:>3}. {}", i + 1, r.title);
         println!("     by {}  [{}]", r.author, r.project_type);
-        println!(
-            "     License: {}  Loaders: {}  MC: {}",
-            license, loaders, latest
-        );
+        println!("     License: {license}  Loaders: {loaders}  MC: {latest}");
         let stats = if r.follows > 0 {
             format!("{}↓ {}★", r.downloads, r.follows)
         } else {

@@ -1,4 +1,4 @@
-use super::types::{CrossPlatform, Dependency, DepKind, Platform, SearchFilters, SearchResult};
+use super::types::{CrossPlatform, DepKind, Dependency, Platform, SearchFilters, SearchResult};
 use crate::api::filters;
 use color_eyre::eyre::Result;
 use serde::Deserialize;
@@ -97,6 +97,17 @@ pub struct ModrinthVersionInfo {
 
 impl ModrinthClient {
     pub async fn search(filters: &SearchFilters) -> Result<Vec<SearchResult>> {
+        fn push_facet(facets: &mut Vec<Vec<String>>, prefix: &str, val: &str) {
+            let parts: Vec<String> = val
+                .split(", ")
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("{prefix}:{s}"))
+                .collect();
+            if !parts.is_empty() {
+                facets.push(parts);
+            }
+        }
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
@@ -108,17 +119,6 @@ impl ModrinthClient {
         ];
 
         let mut facets: Vec<Vec<String>> = Vec::new();
-
-        fn push_facet(facets: &mut Vec<Vec<String>>, prefix: &str, val: &str) {
-            let parts: Vec<String> = val
-                .split(", ")
-                .filter(|s| !s.is_empty())
-                .map(|s| format!("{prefix}:{s}"))
-                .collect();
-            if !parts.is_empty() {
-                facets.push(parts);
-            }
-        }
 
         if let Some(ref v) = filters.version {
             push_facet(&mut facets, "versions", v);
@@ -136,7 +136,7 @@ impl ModrinthClient {
         }
 
         let resp: SearchResponse = client
-            .get(format!("{}/search", BASE))
+            .get(format!("{BASE}/search"))
             .query(&query)
             .send()
             .await?
@@ -188,7 +188,7 @@ impl ModrinthClient {
             .timeout(Duration::from_secs(15))
             .build()?;
         Ok(client
-            .get(format!("{}/project/{}", BASE, slug))
+            .get(format!("{BASE}/project/{slug}"))
             .send()
             .await?
             .error_for_status()?
@@ -212,7 +212,7 @@ impl ModrinthClient {
             query.push(("loaders", serde_json::to_string(&[l])?));
         }
         let resp: Vec<ModrinthVersion> = client
-            .get(format!("{}/project/{}/version", BASE, slug))
+            .get(format!("{BASE}/project/{slug}/version"))
             .query(&query)
             .send()
             .await?
