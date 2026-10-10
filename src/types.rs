@@ -47,6 +47,9 @@ pub struct FileBrowseState {
     pub selected: usize,
     pub already_added: bool,
     pub added_index: Option<usize>,
+    /// Transient one-line message shown in the title (replaces the key hints
+    /// while set), e.g. why `l`/`d` can't open their popup yet.
+    pub hint: Option<String>,
 }
 pub enum BrowseAction {
     Toggle(FilterKind),
@@ -175,6 +178,9 @@ pub enum AppEvent {
         rows: Vec<DepRow>,
     },
     ExportDone(String),
+    /// Warnings from a lockfile rebuild running in the background, so they can
+    /// be shown in the UI instead of printed over the alternate screen.
+    LockWarnings(Vec<String>),
 }
 #[derive(Clone, PartialEq, Eq)]
 pub enum AppMode {

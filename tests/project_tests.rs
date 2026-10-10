@@ -95,6 +95,7 @@ loader = "neoforge"
 sodium = "Sodium 0.8.12 for NeoForge 1.21.1"
 shared = { modrinth = { slug = "shared" }, curseforge = { projectId = 42 }, version = "1.0" }
 split = { modrinth = { slug = "split", version = "1.0-mr" }, curseforge = { projectId = 7, version = "1.0-cf" } }
+renamed = { modrinth = { slug = "real-slug" } }
 "#,
     )
     .unwrap();
@@ -102,21 +103,157 @@ split = { modrinth = { slug = "split", version = "1.0-mr" }, curseforge = { proj
     // inline tables, never [mods.x] sub-tables
     assert!(!out.contains("[mods.shared]"), "sub-table leaked:\n{out}");
     assert!(out.contains("sodium = \"Sodium 0.8.12 for NeoForge 1.21.1\""));
+    // Shared version hoisted, default platform identities shortened.
+    assert!(
+        out.contains("shared = { version = \"1.0\", modrinth = true, curseforge = 42 }"),
+        "unexpected shared render:\n{out}"
+    );
+    // Per-platform versions differ -> both kept inline (slug == key omitted).
     assert!(out.contains(
-        "shared = { modrinth = { slug = \"shared\" }, curseforge = { projectId = 42 }, version = \"1.0\" }"
-    ));
-    assert!(out.contains(
-        "split = { modrinth = { slug = \"split\", version = \"1.0-mr\" }, curseforge = { projectId = 7, version = \"1.0-cf\" } }"
-    ));
+        "split = { modrinth = { version = \"1.0-mr\" }, curseforge = { projectId = 7, version = \"1.0-cf\" } }"
+    ), "unexpected split render:\n{out}");
+    // Slug different from the key stays explicit (short string form).
+    assert!(
+        out.contains("renamed = { modrinth = \"real-slug\" }"),
+        "{out}"
+    );
     // round-trips
     let m2: Manifest = toml::from_str(&out).unwrap();
     assert_eq!(m2.mods["shared"].curseforge_project_id(), Some(42));
+    assert_eq!(m2.mods["shared"].version_for(true).as_deref(), Some("1.0"));
+    assert_eq!(
+        m2.mods["split"].version_for(true).as_deref(),
+        Some("1.0-mr")
+    );
+    assert_eq!(
+        m2.mods["split"].version_for(false).as_deref(),
+        Some("1.0-cf")
+    );
 }
 
 #[test]
 fn tstr_escapes_quotes_and_backslashes() {
     assert_eq!(tstr("a\"b\\c"), "\"a\\\"b\\\\c\"");
     assert_eq!(tstr("plain"), "\"plain\"");
+}
+
+#[test]
+fn parses_every_short_platform_form() {
+    let m: Manifest = toml::from_str(
+        r#"
+[project]
+name = "x"
+minecraft = "1.21.1"
+loader = "neoforge"
+
+[mods]
+both-default = { version = "1.0", modrinth = true, curseforge = true }
+cf-id = { curseforge = 394468 }
+cf-slug = { curseforge = "real-cf-slug" }
+mr-slug = { modrinth = "real-mr-slug" }
+side-only = { side = "client" }
+"#,
+    )
+    .unwrap();
+    assert_eq!(m.mods["both-default"].curseforge_project_id(), None);
+    assert!(m.mods["both-default"].has_modrinth());
+    assert!(m.mods["both-default"].has_curseforge());
+    assert_eq!(m.mods["cf-id"].curseforge_project_id(), Some(394_468));
+    assert!(!m.mods["cf-id"].has_modrinth());
+    assert_eq!(
+        m.mods["cf-slug"].curseforge_slug("cf-slug").as_deref(),
+        Some("real-cf-slug")
+    );
+    assert_eq!(m.mods["mr-slug"].modrinth_slug("mr-slug"), "real-mr-slug");
+    assert_eq!(m.mods["side-only"].side(), Some(Side::Client));
+    assert!(m.mods["side-only"].has_modrinth() && m.mods["side-only"].has_curseforge());
+}
+
+#[test]
+fn render_picks_the_shortest_form() {
+    // Both platforms with default identities: the plain string form, with
+    // `latest` spelled out when nothing is pinned.
+    let m: Manifest = toml::from_str(
+        r#"
+[project]
+name = "x"
+minecraft = "1.21.1"
+loader = "neoforge"
+
+[mods]
+pinned = { version = "1.2.3", modrinth = true, curseforge = true }
+unpinned = { modrinth = true, curseforge = true }
+"#,
+    )
+    .unwrap();
+    let out = m.render();
+    assert!(out.contains("pinned = \"1.2.3\""), "{out}");
+    assert!(out.contains("unpinned = \"latest\""), "{out}");
+    // And both spellings round-trip to the same resolution.
+    let m2: Manifest = toml::from_str(&out).unwrap();
+    assert_eq!(
+        m2.mods["pinned"].version_for(true).as_deref(),
+        Some("1.2.3")
+    );
+    assert_eq!(
+        m2.mods["unpinned"].version_for(true).as_deref(),
+        Some(LATEST)
+    );
+    assert!(is_latest("LATest"));
+}
+
+#[test]
+fn platform_less_table_targets_every_platform() {
+    // `{ version = ... }` / `{ side = ... }` name no platform, so they mean
+    // every platform the pack targets — and normalize to the string form.
+    let m: Manifest = toml::from_str(
+        r#"
+[project]
+name = "x"
+minecraft = "1.21.1"
+loader = "neoforge"
+
+[mods]
+bare-version = { version = "1.0" }
+client-only = { side = "client" }
+"#,
+    )
+    .unwrap();
+    for key in ["bare-version", "client-only"] {
+        assert!(m.mods[key].has_modrinth(), "{key}");
+        assert!(m.mods[key].has_curseforge(), "{key}");
+    }
+    let out = m.render();
+    assert!(out.contains("bare-version = \"1.0\""), "{out}");
+    assert!(out.contains("client-only = { side = \"client\" }"), "{out}");
+    // Round-trips with the same meaning (`None` = newest matching).
+    let m2: Manifest = toml::from_str(&out).unwrap();
+    assert_eq!(m2.mods["client-only"].version_for(true), None);
+    assert_eq!(m2.mods["client-only"].side(), Some(Side::Client));
+    assert_eq!(
+        m2.mods["bare-version"].version_for(true).as_deref(),
+        Some("1.0")
+    );
+}
+
+#[test]
+fn rejects_false_platform_marker() {
+    // `false` would be a second way to say "drop the platform"; removing the
+    // key is the one true spelling, so it is a parse error.
+    assert!(
+        toml::from_str::<Manifest>(
+            r#"
+[project]
+name = "x"
+minecraft = "1.21.1"
+loader = "neoforge"
+
+[mods]
+nope = { modrinth = false }
+"#,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -252,7 +389,8 @@ fn same_file_matches_by_hash_not_name() {
 #[test]
 fn renders_per_platform_versions() {
     // A dep pinned with different names on each platform keeps both names in
-    // the toml: modrinth = { slug, version } + curseforge = { projectId, version }.
+    // the toml: modrinth = { version } + curseforge = { projectId, version }.
+    // (The slug equal to the key is omitted; the differing versions stay.)
     let m: Manifest = toml::from_str(
         r#"
 [project]
@@ -267,7 +405,7 @@ patchouli = { modrinth = { slug = "patchouli", version = "1.21.1-92-neoforge" },
     .unwrap();
     let out = m.render();
     assert!(out.contains(
-        "patchouli = { modrinth = { slug = \"patchouli\", version = \"1.21.1-92-neoforge\" }, curseforge = { projectId = 306770, version = \"Patchouli-1.21.1-92-NEOFORGE.jar\" } }"
+        "patchouli = { modrinth = { version = \"1.21.1-92-neoforge\" }, curseforge = { projectId = 306770, version = \"Patchouli-1.21.1-92-NEOFORGE.jar\" } }"
     ), "per-platform versions not rendered:\n{out}");
     // Round-trips and each platform resolves its own version.
     let m2: Manifest = toml::from_str(&out).unwrap();
@@ -280,4 +418,66 @@ patchouli = { modrinth = { slug = "patchouli", version = "1.21.1-92-neoforge" },
         spec.version_for(false).as_deref(),
         Some("Patchouli-1.21.1-92-NEOFORGE.jar")
     );
+}
+
+#[test]
+fn renders_equal_platform_versions_as_one_shared_version() {
+    // The TUI writes each platform's own version name; when they're equal the
+    // renderer collapses them into a single shared `version`.
+    let m: Manifest = toml::from_str(
+        r#"
+[project]
+name = "x"
+minecraft = "1.21.1"
+loader = "neoforge"
+
+[mods]
+sodium = { modrinth = { slug = "sodium", version = "Sodium 0.8.13 for NeoForge 1.21.1" }, curseforge = { projectId = 394468, version = "Sodium 0.8.13 for NeoForge 1.21.1" } }
+"#,
+    )
+    .unwrap();
+    let out = m.render();
+    assert!(
+        out.contains(
+            "sodium = { version = \"Sodium 0.8.13 for NeoForge 1.21.1\", modrinth = true, curseforge = 394468 }"
+        ),
+        "equal versions not hoisted:\n{out}"
+    );
+    // Both platforms still resolve the hoisted version.
+    let m2: Manifest = toml::from_str(&out).unwrap();
+    let spec = &m2.mods["sodium"];
+    assert_eq!(
+        spec.version_for(true).as_deref(),
+        Some("Sodium 0.8.13 for NeoForge 1.21.1")
+    );
+    assert_eq!(
+        spec.version_for(false).as_deref(),
+        Some("Sodium 0.8.13 for NeoForge 1.21.1")
+    );
+}
+
+#[test]
+fn shared_version_hides_equal_platform_overrides() {
+    // A platform version equal to the shared one is redundant and omitted;
+    // a different one stays as an override.
+    let m: Manifest = toml::from_str(
+        r#"
+[project]
+name = "x"
+minecraft = "1.21.1"
+loader = "neoforge"
+
+[mods]
+mod1 = { version = "1.0", modrinth = { slug = "mod1", version = "1.0" }, curseforge = { projectId = 9, version = "1.0-cf" } }
+"#,
+    )
+    .unwrap();
+    let out = m.render();
+    assert!(out.contains(
+        "mod1 = { version = \"1.0\", modrinth = true, curseforge = { projectId = 9, version = \"1.0-cf\" } }"
+    ), "unexpected render:\n{out}");
+    let m2: Manifest = toml::from_str(&out).unwrap();
+    let spec = &m2.mods["mod1"];
+    assert_eq!(spec.version_for(true).as_deref(), Some("1.0"));
+    assert_eq!(spec.version_for(false).as_deref(), Some("1.0-cf"));
 }

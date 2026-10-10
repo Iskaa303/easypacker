@@ -1,15 +1,14 @@
 use crate::api::filters;
 use crate::api::{
     CurseForgeClient, CurseForgeFileInfo, ModrinthClient, Platform, ProjectFile, SearchFilters,
-    SearchResult,
 };
 use crate::app::App;
 use crate::config::Config;
-use crate::project;
 use crate::types::{
-    AppEvent, BrowseAction, BrowseState, DepRow, DependencyState, FileBrowseState, FilterKind,
-    Focus, LinkVersionState, Status,
+    AppEvent, AppMode, BrowseAction, BrowseState, DepRow, DependencyState, FileBrowseState,
+    FilterKind, Focus, LinkVersionState, Status,
 };
+use crate::{api, project};
 use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -198,9 +197,13 @@ pub fn handle_key(
                     saved,
                 });
             }
+            // `q` backs out to the main menu from any pane that isn't text
+            // entry (in the query box it's just the letter q).
+            KeyCode::Char('q') => app.mode = AppMode::MainMenu,
             _ => {}
         },
         Focus::Results => match key {
+            KeyCode::Char('q') => app.mode = AppMode::MainMenu,
             KeyCode::Up => {
                 app.selected = app.selected.saturating_sub(1);
                 if app.selected < app.scroll {
@@ -289,7 +292,6 @@ pub fn handle_apikey_key(
 }
 
 /// Spawns the API work; the outer function has no awaits of its own.
-#[allow(clippy::too_many_lines)]
 pub fn start_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
     if app.query.is_empty() {
         return;
@@ -342,85 +344,16 @@ pub fn start_search(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Sender<
     let current_offset = app.search_offset;
     app.search_offset += 25;
     tokio::spawn(async move {
-        let mut all: Vec<SearchResult> = Vec::new();
-        for p in &platforms {
-            let event = match p.as_str() {
-                "modrinth" => match ModrinthClient::search(&filters).await {
-                    Ok(results) => Some(results),
-                    Err(e) => {
-                        let _ = tx
-                            .send(AppEvent::Error(format!("Modrinth error: {e}")))
-                            .await;
-                        continue;
-                    }
-                },
-                "curseforge" => {
-                    let Some(k) = &api_key else {
-                        let _ = tx
-                            .send(AppEvent::Error("CurseForge API key not configured.".into()))
-                            .await;
-                        continue;
-                    };
-                    match CurseForgeClient::new(k).search(&filters).await {
-                        Ok(results) => Some(results),
-                        Err(e) => {
-                            let _ = tx
-                                .send(AppEvent::Error(format!("CurseForge error: {e}")))
-                                .await;
-                            continue;
-                        }
-                    }
-                }
-                _ => None,
-            };
-            if let Some(mut results) = event {
-                if let Some(ref pt) = filters.project_type {
-                    let allowed: Vec<&str> = pt.split(", ").map(str::trim).collect();
-                    results.retain(|r| allowed.contains(&r.project_type.to_lowercase().as_str()));
-                }
-                for r in results {
-                    let lower = r.title.to_lowercase();
-                    if let Some(existing) = all.iter_mut().find(|e| e.title.to_lowercase() == lower)
-                    {
-                        match r.platform {
-                            Platform::Modrinth => {
-                                existing.cross.modrinth_downloads = r.downloads;
-                                existing.cross.modrinth_url = r.url;
-                                if r.cross.modrinth_slug.is_some() {
-                                    existing
-                                        .cross
-                                        .modrinth_slug
-                                        .clone_from(&r.cross.modrinth_slug);
-                                }
-                            }
-                            Platform::CurseForge => {
-                                existing.cross.curseforge_downloads = r.downloads;
-                                existing.cross.curseforge_url = r.url;
-                            }
-                        }
-                    } else {
-                        let mut entry = r;
-                        match entry.platform {
-                            Platform::Modrinth => {
-                                entry.cross.modrinth_downloads = entry.downloads;
-                                entry.cross.modrinth_url.clone_from(&entry.url);
-                            }
-                            Platform::CurseForge => {
-                                entry.cross.curseforge_downloads = entry.downloads;
-                                entry.cross.curseforge_url.clone_from(&entry.url);
-                            }
-                        }
-                        all.push(entry);
-                    }
-                }
-            }
+        let (results, errors) = api::search_all(&filters, &platforms, api_key.as_deref()).await;
+        for e in errors {
+            let _ = tx.send(AppEvent::Error(e)).await;
         }
-        if all.is_empty() && !platforms.is_empty() {
+        if results.is_empty() && !platforms.is_empty() {
             return;
         }
         let _ = tx
             .send(AppEvent::Results {
-                results: all,
+                results,
                 offset: current_offset,
             })
             .await;
@@ -513,18 +446,7 @@ fn start_file_fetch(app: &App, cfg: &Config, tx: &tokio::sync::mpsc::Sender<AppE
             match client.get_files(id, None, None).await {
                 Ok(files) => {
                     for cf in files {
-                        let known: Vec<&str> = filters::LOADERS.to_vec();
-                        let loaders: Vec<String> = cf
-                            .game_versions
-                            .iter()
-                            .filter(|v| known.iter().any(|l| v.eq_ignore_ascii_case(l)))
-                            .map(|v| v.to_lowercase())
-                            .collect();
-                        let mc_versions: Vec<String> = cf
-                            .game_versions
-                            .into_iter()
-                            .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
-                            .collect();
+                        let (mc_versions, loaders) = split_cf_versions(&cf.game_versions);
                         let pf = ProjectFile {
                             name: cf.display_name.clone(),
                             mc_versions,
@@ -810,7 +732,7 @@ fn render_apikey_prompt(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_browse(frame: &mut Frame, area: Rect, browse: &BrowseState) {
     let title = format!(
-        " {} — type:filter, Enter:toggle, Tab:apply, Esc:cancel ",
+        " {} — type:filter, Enter:toggle (applies), Tab/Esc:close ",
         browse.kind.label()
     );
     if browse.options.is_empty() {
@@ -1121,6 +1043,19 @@ pub fn render_file_browse(frame: &mut Frame, app: &App) {
         ),
         TitleSpan::raw(format!("  ({})", fb.files.len())),
     ]);
+    // A transient hint (why a popup didn't open) replaces the key hints so it
+    // is actually visible in the title bar.
+    let header = fb.hint.as_ref().map_or(header, |hint| {
+        Line::from(vec![
+            TitleSpan::raw(format!(" {}{} — ", fb.project_title, added)),
+            TitleSpan::styled(
+                format!("{hint} "),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    });
     let lines: Vec<Line> = fb
         .files
         .iter()
@@ -1501,19 +1436,8 @@ pub fn start_link_file_fetch(
         {
             let client = CurseForgeClient::new(key);
             if let Ok(cfs) = client.get_files(id, None, None).await {
-                let known: Vec<&str> = filters::LOADERS.to_vec();
                 for cf in cfs {
-                    let loaders: Vec<String> = cf
-                        .game_versions
-                        .iter()
-                        .filter(|v| known.iter().any(|l| v.eq_ignore_ascii_case(l)))
-                        .map(|v| v.to_lowercase())
-                        .collect();
-                    let mc_versions: Vec<String> = cf
-                        .game_versions
-                        .into_iter()
-                        .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
-                        .collect();
+                    let (mc_versions, loaders) = split_cf_versions(&cf.game_versions);
                     files.push(ProjectFile {
                         name: cf.display_name.clone(),
                         mc_versions,
@@ -1775,24 +1699,28 @@ pub fn start_dependency_fetch(
     });
 }
 
-fn version_matches(versions: &[String], want: &str) -> bool {
-    want.is_empty() || versions.iter().any(|v| v == want)
+/// Split a `CurseForge` file's `gameVersions` into (minecraft versions,
+/// loaders). CF mixes both in one list, plus "Client"/"Server" side markers
+/// and a literal "Minecraft" entry that are not versions — drop those so the
+/// MC column shows a real game version.
+pub fn split_cf_versions(versions: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut mc = Vec::new();
+    let mut loaders = Vec::new();
+    for v in versions {
+        if filters::LOADERS.iter().any(|l| v.eq_ignore_ascii_case(l)) {
+            loaders.push(v.to_lowercase());
+        } else if !v.eq_ignore_ascii_case("client")
+            && !v.eq_ignore_ascii_case("server")
+            && !v.eq_ignore_ascii_case("minecraft")
+        {
+            mc.push(v.clone());
+        }
+    }
+    (mc, loaders)
 }
 
-/// `CurseForge` display names are often the raw archive filename (e.g.
-/// "iceandfire-2.1-beta.1.jar") rather than a real version name. When that's
-/// the case, prefer the modrinth version name — they're the same file (same
-/// sha1), so the modrinth name is the readable version.
-pub fn readable_cf_name(cf_name: &str, mr_name: Option<&str>) -> String {
-    let lower = cf_name.to_lowercase();
-    let is_filename = [".jar", ".zip", ".rar", ".7z", ".litemod", ".mcpack"]
-        .iter()
-        .any(|ext| lower.ends_with(ext));
-    if is_filename {
-        mr_name.unwrap_or(cf_name).to_string()
-    } else {
-        cf_name.to_string()
-    }
+fn version_matches(versions: &[String], want: &str) -> bool {
+    want.is_empty() || versions.iter().any(|v| v == want)
 }
 
 /// Merge curseforge file infos into a project-file list, hash-matching
@@ -1805,19 +1733,7 @@ fn merge_cf_files(
     project_id: Option<i64>,
 ) {
     for f in fs {
-        let known: Vec<&str> = filters::LOADERS.to_vec();
-        let loaders: Vec<String> = f
-            .game_versions
-            .iter()
-            .filter(|v| known.iter().any(|l| v.eq_ignore_ascii_case(l)))
-            .map(|v| v.to_lowercase())
-            .collect();
-        let mc_versions: Vec<String> = f
-            .game_versions
-            .iter()
-            .filter(|v| !known.iter().any(|l| v.eq_ignore_ascii_case(l)))
-            .cloned()
-            .collect();
+        let (mc_versions, loaders) = split_cf_versions(&f.game_versions);
         if !version_matches(&mc_versions, mc) {
             continue;
         }

@@ -10,12 +10,13 @@ use crate::types::{
     Status,
 };
 use crate::ui;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, bail};
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use crossterm::tty::IsTty;
 use ratatui::Frame;
 use ratatui_image::picker::Picker;
 use std::collections::HashSet;
@@ -23,6 +24,17 @@ use std::fmt::Write as _;
 use std::io::stdout;
 
 pub fn run_tui(_cfg: Config, project: Option<project::Manifest>) -> Result<()> {
+    if !std::io::stdin().is_tty() {
+        bail!(
+            "the TUI needs a terminal; in scripts use: easypacker search | init | add | remove | list | set | export"
+        );
+    }
+    // `Picker::from_query_stdio` asks the terminal and *reads stdin* while it
+    // waits for the answer, which swallows the first keys the user types and
+    // races our raw mode (it enables and disables it from a helper thread).
+    // Halfblocks renders these small icons fine without any of that.
+    let picker = Picker::halfblocks();
+
     enable_raw_mode()?;
     let mut stdout = stdout();
     stdout.execute(EnterAlternateScreen)?;
@@ -51,7 +63,7 @@ pub fn run_tui(_cfg: Config, project: Option<project::Manifest>) -> Result<()> {
         visible_count: std::cell::Cell::new(0),
         filter_selected: 0,
         api_key_input: String::new(),
-        picker: Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()),
+        picker,
         proto_cache: Vec::new(),
         mode,
         project,
@@ -74,10 +86,8 @@ pub fn run_tui(_cfg: Config, project: Option<project::Manifest>) -> Result<()> {
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Err(e) = res {
-        eprintln!("{e:?}");
-    }
-    Ok(())
+    // A crash inside the TUI must not look like a clean exit.
+    res
 }
 
 /// The TUI event loop — draw, poll events, dispatch per mode. Long but a
@@ -158,7 +168,7 @@ fn run(
                             if let Some(ref mut fb) = app.file_browse
                                 && fb.selected < fb.files.len()
                             {
-                                let f = &fb.files[fb.selected];
+                                let f = fb.files[fb.selected].clone();
                                 let cwd = std::env::current_dir().unwrap_or_default();
                                 if let Ok(mut manifest) = project::Manifest::load(&cwd) {
                                     let key = fb
@@ -172,20 +182,17 @@ fn run(
                                             app.project = Some(manifest);
                                             fb.already_added = false;
                                             fb.added_index = None;
-                                            let cwd2 = cwd.clone();
-                                            tokio::spawn(async move {
-                                                let cfg = Config::load().unwrap_or_default();
-                                                if let Err(e) = lock::generate(&cwd2, &cfg).await {
-                                                    eprintln!("lock: {e}");
-                                                }
-                                            });
+                                            spawn_lock_regen(cwd.clone(), tx);
                                         }
                                     } else {
-                                        // Add or change version. Write each
-                                        // platform's own version name (they
-                                        // can differ for the same file, e.g.
-                                        // modrinth "Fresh Animations 1.10.4"
-                                        // vs curseforge "FA 1.10.4").
+                                        // Add or change version. Each platform
+                                        // gets its own version name (they can
+                                        // differ for the same file, e.g.
+                                        // modrinth "Fresh Animations 1.10.4" vs
+                                        // curseforge "FA 1.10.4"), and platform
+                                        // identities the picked file doesn't
+                                        // cover (a `link`, or CF files not
+                                        // fetched) are kept rather than wiped.
                                         let has_mr = f.modrinth_version_id.is_some()
                                             && fb.modrinth_slug.is_some();
                                         let has_cf = f.curseforge_file_id.is_some()
@@ -195,28 +202,49 @@ fn run(
                                                 .clone()
                                                 .unwrap_or_else(|| f.name.clone())
                                         });
+                                        // Each platform's *own* name: the
+                                        // resolver matches by it, so a
+                                        // prettified one (the CF display name
+                                        // is often a raw filename) would not
+                                        // resolve there.
                                         let cf_version = has_cf.then(|| {
-                                            search::readable_cf_name(
-                                                &f.curseforge_name
-                                                    .clone()
-                                                    .unwrap_or_else(|| f.name.clone()),
-                                                mr_version.as_deref(),
-                                            )
+                                            f.curseforge_name
+                                                .clone()
+                                                .unwrap_or_else(|| f.name.clone())
                                         });
+                                        let (version, side, mut modrinth, mut curseforge) =
+                                            match manifest.cat(&fb.project_type).get(&key).cloned()
+                                            {
+                                                Some(project::ModSpec::Simple(v)) => (
+                                                    Some(v),
+                                                    None,
+                                                    Some(project::ModrinthSpec::default()),
+                                                    Some(project::CurseForgeSpec::default()),
+                                                ),
+                                                Some(project::ModSpec::Detailed(d)) => {
+                                                    (d.version, d.side, d.modrinth, d.curseforge)
+                                                }
+                                                None => (None, None, None, None),
+                                            };
+                                        if has_mr {
+                                            modrinth = Some(project::ModrinthSpec {
+                                                slug: fb.modrinth_slug.clone(),
+                                                version: mr_version,
+                                            });
+                                        }
+                                        if has_cf {
+                                            curseforge = Some(project::CurseForgeSpec {
+                                                project_id: fb.curseforge_id.map(i64::from),
+                                                version: cf_version,
+                                                ..Default::default()
+                                            });
+                                        }
                                         let spec =
                                             project::ModSpec::Detailed(project::DetailedSpec {
-                                                side: None,
-                                                version: None,
-                                                modrinth: has_mr.then(|| project::ModrinthSpec {
-                                                    slug: fb.modrinth_slug.clone(),
-                                                    version: mr_version,
-                                                }),
-                                                curseforge: has_cf.then(|| {
-                                                    project::CurseForgeSpec {
-                                                        project_id: fb.curseforge_id.map(i64::from),
-                                                        version: cf_version,
-                                                    }
-                                                }),
+                                                version,
+                                                modrinth,
+                                                curseforge,
+                                                side,
                                             });
                                         manifest.cat_mut(&fb.project_type).insert(key, spec);
                                         if manifest.save(&cwd).is_ok() {
@@ -224,13 +252,7 @@ fn run(
                                             fb.already_added = true;
                                             fb.added_index = Some(fb.selected);
                                             did_add = true;
-                                            let cwd2 = cwd.clone();
-                                            tokio::spawn(async move {
-                                                let cfg = Config::load().unwrap_or_default();
-                                                if let Err(e) = lock::generate(&cwd2, &cfg).await {
-                                                    eprintln!("lock: {e}");
-                                                }
-                                            });
+                                            spawn_lock_regen(cwd.clone(), tx);
                                         }
                                     }
                                 }
@@ -246,6 +268,9 @@ fn run(
                             open_link_version_popup(app);
                         }
                         KeyCode::Char('d') => {
+                            if let Some(fb) = app.file_browse.as_mut() {
+                                fb.hint = None;
+                            }
                             open_dependency_popup(app, &Config::load().unwrap_or_default(), tx);
                         }
                         _ => {}
@@ -326,18 +351,29 @@ fn run(
                         curseforge_id.map(i64::from),
                     );
                     let already = in_manifest || lock_ver.is_some();
-                    let added_index = if in_manifest {
-                        manifest.and_then(|m| {
-                            let ver = m.version_of(
+                    // The manifest pin wins; otherwise fall back to what the
+                    // lockfile pinned (an unpinned manifest entry, or a dep
+                    // resolved automatically), so the added row is marked.
+                    // `version = "latest"` is not a real version name — let
+                    // the lockfile's resolved version mark the row instead.
+                    let pinned = manifest
+                        .as_ref()
+                        .and_then(|m| {
+                            m.version_of(
                                 &project_type,
                                 modrinth_slug.as_deref(),
                                 curseforge_id.map(i64::from),
-                            )?;
-                            files.iter().position(|f| f.name == ver)
+                            )
                         })
-                    } else {
-                        lock_ver.and_then(|ver| files.iter().position(|f| f.name == ver))
-                    };
+                        .filter(|v| !project::is_latest(v))
+                        .or(lock_ver);
+                    let added_index = pinned.and_then(|ver| {
+                        files.iter().position(|f| {
+                            f.name == ver
+                                || f.modrinth_name.as_deref() == Some(ver.as_str())
+                                || f.curseforge_name.as_deref() == Some(ver.as_str())
+                        })
+                    });
                     app.file_browse = Some(FileBrowseState {
                         project_title,
                         modrinth_slug,
@@ -348,6 +384,7 @@ fn run(
                         selected: 0,
                         already_added: already,
                         added_index,
+                        hint: None,
                     });
                     app.mode = AppMode::FileBrowse;
                 }
@@ -422,6 +459,22 @@ fn run(
                         };
                     }
                 }
+                AppEvent::LockWarnings(warnings) => {
+                    if warnings.is_empty() {
+                        continue;
+                    }
+                    let msg = warnings.join("; ");
+                    match app.mode {
+                        // The search screen has a status line; elsewhere the
+                        // file-browse title bar is the nearest thing.
+                        AppMode::Search => app.status = Status::Error(msg),
+                        _ => {
+                            if let Some(fb) = app.file_browse.as_mut() {
+                                fb.hint = Some(format!("lockfile: {msg}"));
+                            }
+                        }
+                    }
+                }
                 AppEvent::ExportDone(msg) => {
                     if app.mode == AppMode::Export
                         && let Some(ref mut export) = app.export_state
@@ -486,7 +539,7 @@ fn render_browse_simple(frame: &mut Frame, area: ratatui::layout::Rect, browse: 
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{List, ListItem};
     let title = format!(
-        " {} — type:filter, Enter:toggle, Tab:apply, Esc:cancel ",
+        " {} — type:filter, Enter:toggle (applies), Tab/Esc:close ",
         browse.kind.label()
     );
     if browse.options.is_empty() {
@@ -548,41 +601,59 @@ fn render_browse_simple(frame: &mut Frame, area: ratatui::layout::Rect, browse: 
 /// added file's platforms may be unknown on a reopen), and only opens if
 /// the other platform's slug/id is actually known.
 fn open_link_version_popup(app: &mut App) {
-    let Some(ref fb) = app.file_browse else {
+    let Some(fb) = app.file_browse.as_ref() else {
         return;
     };
+    let (project_type, modrinth_slug, curseforge_id, project_title, selected) = (
+        fb.project_type.clone(),
+        fb.modrinth_slug.clone(),
+        fb.curseforge_id,
+        fb.project_title.clone(),
+        fb.selected,
+    );
+    let selected_platform = fb
+        .files
+        .get(selected)
+        .and_then(|f| f.platforms.first().copied());
     let cwd = std::env::current_dir().unwrap_or_default();
     let spec = project::Manifest::load(&cwd).ok().and_then(|m| {
         m.spec_for(
-            &fb.project_type,
-            fb.modrinth_slug.as_deref(),
-            fb.curseforge_id.map(i64::from),
+            &project_type,
+            modrinth_slug.as_deref(),
+            curseforge_id.map(i64::from),
         )
         .cloned()
     });
-    let Some(spec) = spec else { return };
-    let has_mr = spec.has_modrinth();
-    let has_cf = spec.has_curseforge();
+    let hint = |app: &mut App, msg: &str| {
+        if let Some(fb) = app.file_browse.as_mut() {
+            fb.hint = Some(msg.to_owned());
+        }
+    };
+    let Some(spec) = spec else {
+        // Linking merges into an entry that already pins a version — say so
+        // instead of doing nothing.
+        hint(app, "add a version first (Enter), then press l to link");
+        return;
+    };
     // Target the missing platform; if both are already linked, let the user
     // change whichever platform the currently-selected file is on.
-    let platform = match (!has_mr, !has_cf) {
+    let platform = match (!spec.has_modrinth(), !spec.has_curseforge()) {
         (true, false) => Platform::Modrinth,
         (false, true) => Platform::CurseForge,
-        (false, false) => {
-            // Both linked — change the selected file's own platform.
-            fb.files
-                .get(fb.selected)
-                .and_then(|f| f.platforms.first().copied())
-                .unwrap_or(Platform::CurseForge)
+        (false, false) => selected_platform.unwrap_or(Platform::CurseForge),
+        (true, true) => {
+            hint(app, "this entry has no platform to link from");
+            return;
         }
-        (true, true) => return, // spec neither — nothing to relink from
     };
 
-    let query = fb.project_title.clone();
-    let cursor = query.chars().count();
+    if let Some(fb) = app.file_browse.as_mut() {
+        fb.hint = None;
+    }
+    let cursor = project_title.chars().count();
     app.link_version = Some(LinkVersionState {
         platform,
-        query,
+        query: project_title,
         cursor,
         scroll: 0,
         selected: 0,
@@ -591,6 +662,23 @@ fn open_link_version_popup(app: &mut App) {
         picked: None,
         status: None,
         searched_query: None,
+    });
+}
+
+/// Rebuild Easypacker.lock in the background after a manifest write. The
+/// warnings come back through the event channel so the caller can show them
+/// without printing over the alternate screen.
+fn spawn_lock_regen(cwd: std::path::PathBuf, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let cfg = Config::load().unwrap_or_default();
+        let warnings = match lock::generate(&cwd, &cfg).await {
+            Ok(r) => r.warnings,
+            Err(e) => vec![format!("lockfile not updated: {e}")],
+        };
+        if !warnings.is_empty() {
+            let _ = tx.send(AppEvent::LockWarnings(warnings)).await;
+        }
     });
 }
 
@@ -728,7 +816,7 @@ fn handle_link_version(
                 )
             };
             app.link_version = None;
-            apply_link_version(app, platform, chosen, picked.as_ref());
+            apply_link_version(app, platform, chosen, picked.as_ref(), tx);
         }
         _ => {}
     }
@@ -741,6 +829,7 @@ fn apply_link_version(
     platform: Platform,
     chosen: Option<ProjectFile>,
     picked: Option<&PickedProject>,
+    tx: &tokio::sync::mpsc::Sender<AppEvent>,
 ) {
     let Some(chosen) = chosen else {
         return;
@@ -824,6 +913,7 @@ fn apply_link_version(
                     d.curseforge = Some(project::CurseForgeSpec {
                         project_id: picked_id.map(i64::from),
                         version: Some(chosen_name),
+                        ..Default::default()
                     });
                 }
                 _ => {}
@@ -831,13 +921,7 @@ fn apply_link_version(
         }
         if manifest.save(&cwd).is_ok() {
             app.project = Some(manifest);
-            let cwd2 = cwd.clone();
-            tokio::spawn(async move {
-                let cfg = Config::load().unwrap_or_default();
-                if let Err(e) = lock::generate(&cwd2, &cfg).await {
-                    eprintln!("lock: {e}");
-                }
-            });
+            spawn_lock_regen(cwd.clone(), tx);
         }
     }
 }
@@ -866,7 +950,7 @@ fn open_dependency_popup(app: &mut App, cfg: &Config, tx: &tokio::sync::mpsc::Se
 /// Space toggles optional deps, `v` opens/commits the version picker,
 /// Enter commits (in picker) or applies all choices and rebuilds the lock.
 #[allow(clippy::too_many_lines)]
-fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+fn handle_dependency_popup(app: &mut App, key: KeyCode, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
     let in_picker = app
         .dependencies
         .as_ref()
@@ -951,7 +1035,7 @@ fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync::mpsc:
                     row.changed = selected > 0;
                     dep.version_picker = None;
                 }
-                apply_dependencies(app);
+                apply_dependencies(app, tx);
             } else {
                 let sel = app.dependencies.as_ref().unwrap().selected;
                 let has_versions = app
@@ -1002,7 +1086,7 @@ fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync::mpsc:
                     row.changed = selected > 0;
                     dep.version_picker = None;
                 }
-                apply_dependencies(app);
+                apply_dependencies(app, tx);
             } else if let Some(row) = app
                 .dependencies
                 .as_ref()
@@ -1037,7 +1121,7 @@ fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync::mpsc:
             };
             // Persist the toggle immediately.
             if toggled {
-                apply_dependencies(app);
+                apply_dependencies(app, tx);
             }
         }
         _ => {}
@@ -1053,7 +1137,7 @@ fn handle_dependency_popup(app: &mut App, key: KeyCode, _tx: &tokio::sync::mpsc:
 /// `patchouli = { modrinth = { slug, version = "..." }, curseforge = { projectId,
 /// version = "..." } }`. Enabled optional deps get a platform-scoped entry
 /// with no version (lock resolves highest). Untoggled optionals are removed.
-fn apply_dependencies(app: &mut App) {
+fn apply_dependencies(app: &mut App, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
     let Some(ref dep_state) = app.dependencies else {
         return;
     };
@@ -1077,9 +1161,8 @@ fn apply_dependencies(app: &mut App) {
             let cf_name = picked
                 .and_then(|f| f.curseforge_name.clone())
                 .or_else(|| (row.platform == Platform::CurseForge).then(|| v.clone()));
-            // Use the modrinth name when the curseforge one is a raw filename.
-            let cf_version =
-                cf_name.map(|name| search::readable_cf_name(&name, mr_name.as_deref()));
+            // Store each platform's own name (the resolver matches on it).
+            let cf_version = cf_name;
             let cf_project_id = picked.and_then(|f| f.curseforge_project_id);
             let spec = project::ModSpec::Detailed(project::DetailedSpec {
                 side: None,
@@ -1091,6 +1174,7 @@ fn apply_dependencies(app: &mut App) {
                 curseforge: cf_version.map(|name| project::CurseForgeSpec {
                     project_id: cf_project_id.or_else(|| row.project_id.parse::<i64>().ok()),
                     version: Some(name),
+                    ..Default::default()
                 }),
             });
             to_insert.push((row.id.clone(), spec));
@@ -1113,6 +1197,7 @@ fn apply_dependencies(app: &mut App) {
                     curseforge: Some(project::CurseForgeSpec {
                         project_id: row.project_id.parse::<i64>().ok(),
                         version: None,
+                        ..Default::default()
                     }),
                 }),
             };
@@ -1134,13 +1219,7 @@ fn apply_dependencies(app: &mut App) {
         }
         if manifest.save(&cwd).is_ok() {
             app.project = Some(manifest);
-            let cwd2 = cwd.clone();
-            tokio::spawn(async move {
-                let cfg = Config::load().unwrap_or_default();
-                if let Err(e) = lock::generate(&cwd2, &cfg).await {
-                    eprintln!("lock: {e}");
-                }
-            });
+            spawn_lock_regen(cwd.clone(), tx);
         }
     }
 }
@@ -1165,9 +1244,6 @@ fn handle_welcome(app: &mut App, key: KeyCode) {
         ui::WelcomeAction::None => {}
     }
 }
-
-// HACK: we need to break from the outer run loop on quit. Using a separate variable.
-// Actually let's just use a return on quit. The outer loop will see the mode change.
 
 fn handle_menu(app: &mut App, key: KeyCode) {
     let choice = ui::handle_main_menu_key(key, &mut app.menu_selection);
@@ -1329,7 +1405,12 @@ fn handle_search_mode(
             KeyCode::Char('f') | KeyCode::Tab => app.focus = Focus::Filters,
             KeyCode::Char('r') | KeyCode::BackTab => app.focus = Focus::Results,
             KeyCode::Esc => {}
-            _ => app.focus = Focus::Query,
+            // Focus the query box and feed the key through, so the first
+            // typed character starts the query instead of being swallowed.
+            _ => {
+                app.focus = Focus::Query;
+                search::handle_key(app, key, &Config::load().unwrap_or_default(), tx);
+            }
         }
     } else if app.status == Status::ApiKeyPrompt {
         let mut cfg = Config::load().unwrap_or_default();
@@ -1358,7 +1439,7 @@ fn handle_search_mode(
     }
 }
 
-fn handle_form_mode(app: &mut App, key: KeyCode, _tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+fn handle_form_mode(app: &mut App, key: KeyCode, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
     if app.browse_mode.is_some() {
         let action = {
             let b = app.browse_mode.as_mut().unwrap();
@@ -1407,6 +1488,11 @@ fn handle_form_mode(app: &mut App, key: KeyCode, _tx: &tokio::sync::mpsc::Sender
                         let cwd = std::env::current_dir().unwrap_or_default();
                         if let Err(e) = m.save(&cwd) {
                             eprintln!("Failed to save project: {e}");
+                        } else {
+                            // minecraft/loader/platforms all change what the
+                            // lockfile must pin — rebuild it, like every other
+                            // manifest write in the TUI.
+                            spawn_lock_regen(cwd, tx);
                         }
                     }
                 } else {

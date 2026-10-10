@@ -3,6 +3,7 @@ name = "easypacker"
 version = "0.1.0"
 edition = "2024"
 description = "A simple TUI/CLI tool for creating Minecraft Modpacks."
+license = "AGPL-3.0-or-later"
 # tests/*.rs are #[path]-included unit-test modules (they test private
 # items); don't also compile them as standalone integration tests.
 autotests = false
@@ -14,7 +15,8 @@ lto = true
 codegen-units = 1
 
 [lints.rust]
-unused = { level = "warn", priority = -1 }
+# No dead code, no unused variables/imports: deny, not warn.
+unused = { level = "deny", priority = -1 }
 unsafe_code = "deny"
 
 [lints.clippy]
@@ -22,17 +24,17 @@ pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 ratatui = "0.30"
-crossterm = "0.28"
+crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls", "rustls-native-certs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 color-eyre = "0.6"
-dirs = "6"
+dirs = "7"
 ratatui-image = { version = "11", default-features = false }
 rpassword = "7"
-toml = "0.9"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+toml = "1"
+zip = { version = "9", default-features = false, features = ["deflate"] }

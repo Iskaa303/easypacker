@@ -2,11 +2,14 @@
 //! Modrinth/CurseForge and pins exact files, download urls and hashes.
 //! Regenerated on every run; never edit by hand (cargo-style).
 
-use crate::api::types::{DepKind, Platform};
-use crate::api::{CurseForgeClient, CurseForgeFileInfo, ModrinthClient, ModrinthVersionInfo};
+use crate::api::types::{DepKind, Dependency, Platform};
+use crate::api::{
+    CurseForgeClient, CurseForgeFileInfo, ModrinthClient, ModrinthProjectInfo, ModrinthVersionInfo,
+};
 use crate::config::Config;
-use crate::project::{CATEGORIES, Manifest, ModSpec, tstr};
+use crate::project::{CATEGORIES, Manifest, ModSpec, is_latest, tstr};
 use color_eyre::eyre::{Result, bail};
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -72,6 +75,9 @@ struct LockHashes {
 struct LockDep {
     id: String,
     optional: bool,
+    /// Declared incompatible with the parent: never pinned, but reported when
+    /// the other side is in the pack anyway.
+    incompatible: bool,
 }
 
 impl LockHashes {
@@ -82,6 +88,59 @@ impl LockHashes {
             Some(Self { sha1, sha512, md5 })
         }
     }
+}
+
+/// The fields each platform pin are the same everywhere a version/file is
+/// turned into a lock row (main entries, cross-lookups, dependency rows),
+/// so the construction lives here exactly once.
+impl LockModrinth {
+    fn from_version(project: &ModrinthProjectInfo, v: &ModrinthVersionInfo) -> Self {
+        Self {
+            slug: project.slug.clone(),
+            project_id: project.id.clone(),
+            version_id: v.id.clone(),
+            version: v.name.clone(),
+            filename: v.filename.clone(),
+            url: v.url.clone(),
+            size: v.size,
+            hashes: LockHashes::new(v.sha1.clone(), v.sha512.clone(), None),
+            dependencies: deps_from(&v.dependencies),
+        }
+    }
+}
+
+impl LockCurseForge {
+    fn from_file(mod_id: i32, f: &CurseForgeFileInfo, slug: String) -> Self {
+        Self {
+            project_id: i64::from(mod_id),
+            file_id: i64::from(f.id),
+            version: f.display_name.clone(),
+            filename: f.file_name.clone(),
+            url: cf_download_url(f),
+            size: f.file_length,
+            hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
+            dependencies: deps_from(&f.dependencies),
+            slug,
+        }
+    }
+}
+
+/// Required + optional dependency edges, as lock rows understand them.
+/// Dependency edges as lock rows understand them. Incompatible relations are
+/// kept too (the resolver reports conflicts with them) but never pinned.
+fn deps_from(deps: &[Dependency]) -> Vec<LockDep> {
+    deps.iter()
+        .filter(|d| {
+            d.kind == DepKind::Required
+                || d.kind == DepKind::Optional
+                || d.kind == DepKind::Incompatible
+        })
+        .map(|d| LockDep {
+            id: d.project_id.clone(),
+            optional: d.kind == DepKind::Optional,
+            incompatible: d.kind == DepKind::Incompatible,
+        })
+        .collect()
 }
 
 /// Find the counterpart file whose sha1 matches `want` (names differ between
@@ -129,9 +188,64 @@ fn cf_download_url(f: &CurseForgeFileInfo) -> Option<String> {
     })
 }
 
+/// Outcome of one lockfile rebuild. Warnings are returned instead of printed
+/// so the caller decides where they go (stderr for the CLI, an in-TUI status
+/// line for the TUI — the alternate screen must not be scribbled on).
 pub struct Report {
     pub resolved: usize,
     pub failed: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Read-only view of Easypacker.lock for the lookups that only need a few
+/// fields (known ids, pinned version). Parsed with serde instead of walking
+/// `toml::Value` by hand.
+#[derive(Deserialize, Default)]
+struct LockToml {
+    #[serde(default, rename = "mod")]
+    mod_: Vec<LockEntryToml>,
+    #[serde(default)]
+    resourcepack: Vec<LockEntryToml>,
+    #[serde(default)]
+    datapack: Vec<LockEntryToml>,
+    #[serde(default)]
+    shader: Vec<LockEntryToml>,
+}
+
+#[derive(Deserialize)]
+struct LockEntryToml {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    modrinth: Option<LockMrToml>,
+    #[serde(default)]
+    curseforge: Option<LockCfToml>,
+}
+
+#[derive(Deserialize)]
+struct LockMrToml {
+    #[serde(default)]
+    slug: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LockCfToml {
+    #[serde(default)]
+    project_id: Option<i64>,
+}
+
+impl LockToml {
+    fn read(dir: &Path) -> Option<Self> {
+        toml::from_str(&std::fs::read_to_string(dir.join(LOCK_FILE)).ok()?).ok()
+    }
+
+    fn entries(&self) -> impl Iterator<Item = &LockEntryToml> {
+        self.mod_
+            .iter()
+            .chain(&self.resourcepack)
+            .chain(&self.datapack)
+            .chain(&self.shader)
+    }
 }
 
 /// Collect the project ids present in an existing lockfile, so the search
@@ -145,31 +259,15 @@ pub fn read_known_ids(
 ) {
     let mut slugs = std::collections::HashSet::new();
     let mut cf_ids = std::collections::HashSet::new();
-    let Ok(raw) = std::fs::read_to_string(dir.join(LOCK_FILE)) else {
+    let Some(lock) = LockToml::read(dir) else {
         return (slugs, cf_ids);
     };
-    let Ok(toml) = toml::from_str::<toml::Value>(&raw) else {
-        return (slugs, cf_ids);
-    };
-    for key in ["mod", "resourcepack", "datapack", "shader"] {
-        let Some(arr) = toml.get(key).and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for entry in arr {
-            if let Some(slug) = entry
-                .get("modrinth")
-                .and_then(|v| v.get("slug"))
-                .and_then(|v| v.as_str())
-            {
-                slugs.insert(slug.to_owned());
-            }
-            if let Some(pid) = entry
-                .get("curseforge")
-                .and_then(|v| v.get("project_id"))
-                .and_then(toml::Value::as_integer)
-            {
-                cf_ids.insert(pid);
-            }
+    for entry in lock.entries() {
+        if let Some(slug) = entry.modrinth.as_ref().and_then(|m| m.slug.clone()) {
+            slugs.insert(slug);
+        }
+        if let Some(pid) = entry.curseforge.as_ref().and_then(|c| c.project_id) {
+            cf_ids.insert(pid);
         }
     }
     (slugs, cf_ids)
@@ -183,31 +281,16 @@ pub fn read_lock_version(
     modrinth_slug: Option<&str>,
     curseforge_id: Option<i64>,
 ) -> Option<String> {
-    let raw = std::fs::read_to_string(dir.join(LOCK_FILE)).ok()?;
-    let toml: toml::Value = toml::from_str(&raw).ok()?;
-    for key in ["mod", "resourcepack", "datapack", "shader"] {
-        let arr = toml.get(key)?.as_array()?;
-        for entry in arr {
-            let slug_match = modrinth_slug.is_some_and(|s| {
-                entry
-                    .get("modrinth")
-                    .and_then(|v| v.get("slug"))
-                    .and_then(|v| v.as_str())
-                    == Some(s)
-            });
-            let cf_match = curseforge_id.is_some_and(|id| {
-                entry
-                    .get("curseforge")
-                    .and_then(|v| v.get("project_id"))
-                    .and_then(toml::Value::as_integer)
-                    == Some(id)
-            });
-            if slug_match || cf_match {
-                return entry
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned);
-            }
+    let lock = LockToml::read(dir)?;
+    for entry in lock.entries() {
+        let slug_match = modrinth_slug
+            .is_some_and(|s| entry.modrinth.as_ref().and_then(|m| m.slug.as_deref()) == Some(s));
+        let cf_match = curseforge_id
+            .is_some_and(|id| entry.curseforge.as_ref().and_then(|c| c.project_id) == Some(id));
+        if (slug_match || cf_match)
+            && let Some(v) = &entry.version
+        {
+            return Some(v.clone());
         }
     }
     None
@@ -239,10 +322,11 @@ pub async fn generate(dir: &Path, cfg: &Config) -> Result<Report> {
     let want_mr = targets.iter().any(|t| t == "modrinth");
     let want_cf = targets.iter().any(|t| t == "curseforge");
 
+    let mut warnings: Vec<String> = Vec::new();
     let cf = if want_cf {
         let key = cfg.get_api_key(None, Some(dir));
         if key.is_err() {
-            eprintln!("easypacker: no CurseForge API key — CurseForge pins skipped");
+            warnings.push("no CurseForge API key configured — CurseForge pins skipped".into());
         }
         key.ok().map(|k| Arc::new(CurseForgeClient::new(&k)))
     } else {
@@ -273,19 +357,21 @@ pub async fn generate(dir: &Path, cfg: &Config) -> Result<Report> {
     let (mut resolved, mut failed) = (BTreeMap::new(), 0usize);
     while let Some(joined) = set.join_next().await {
         match joined {
-            Ok((cat, id, Ok(entry), warnings)) => {
-                for w in warnings {
-                    eprintln!("easypacker: {cat}/{id}: {w}");
-                }
+            Ok((cat, id, Ok(entry), entry_warnings)) => {
+                warnings.extend(
+                    entry_warnings
+                        .into_iter()
+                        .map(|w| format!("{cat}/{id}: {w}")),
+                );
                 resolved.insert((cat, id), entry);
             }
             Ok((cat, id, Err(e), _)) => {
                 failed += 1;
-                eprintln!("easypacker: {cat}/{id}: {e}");
+                warnings.push(format!("{cat}/{id}: {e}"));
             }
             Err(e) => {
                 failed += 1;
-                eprintln!("easypacker: resolver task failed: {e}");
+                warnings.push(format!("resolver task failed: {e}"));
             }
         }
     }
@@ -305,16 +391,19 @@ pub async fn generate(dir: &Path, cfg: &Config) -> Result<Report> {
         .cloned()
         .collect();
 
-    // Resolve transitive dependencies (cargo-style): each manifest entry
-    // declares dep ids; unresolved ones become their own lock rows.
+    // Resolve dependencies (cargo-style): each manifest entry declares dep
+    // ids; unresolved ones become their own lock rows, transitively.
     let dep_entries = resolve_dependencies(
         &mut resolved,
         &manifest_ids,
-        &proj.minecraft,
-        &proj.loader,
-        want_mr,
-        want_cf,
-        cf.clone(),
+        DepContext {
+            mc: &proj.minecraft,
+            loader: &proj.loader,
+            want_mr,
+            want_cf,
+            cf: cf.clone(),
+        },
+        &mut warnings,
     )
     .await;
 
@@ -345,6 +434,7 @@ pub async fn generate(dir: &Path, cfg: &Config) -> Result<Report> {
     Ok(Report {
         resolved: resolved_count,
         failed,
+        warnings,
     })
 }
 
@@ -368,7 +458,9 @@ async fn resolve_entry(
     let is_mod = cat == "mod";
     let mut warnings = Vec::new();
     let mut name: Option<String> = None;
-    let mut version_name: Option<String> = spec.shared_version();
+    // `latest` means "newest matching", which the resolver already does with
+    // no pin — drop the marker so the lock records the resolved version.
+    let mut version_name: Option<String> = spec.shared_version().filter(|v| !is_latest(v));
     let mut mr_lock = None;
     let mut cf_lock = None;
     // Stash by-name resolution errors; only surface them if the hash
@@ -439,25 +531,7 @@ async fn resolve_entry(
             Ok(files) => {
                 let want = l.hashes.as_ref().and_then(|h| h.sha1.as_deref());
                 if let Some(f) = cf_file_matching(&files, want) {
-                    cf_lock = Some(LockCurseForge {
-                        project_id: i64::from(mod_id),
-                        file_id: i64::from(f.id),
-                        version: f.display_name.clone(),
-                        filename: f.file_name.clone(),
-                        url: cf_download_url(f),
-                        size: f.file_length,
-                        hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
-                        dependencies: f
-                            .dependencies
-                            .iter()
-                            .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
-                            .map(|d| LockDep {
-                                id: d.project_id.clone(),
-                                optional: d.kind == DepKind::Optional,
-                            })
-                            .collect(),
-                        slug: l.slug.clone(),
-                    });
+                    cf_lock = Some(LockCurseForge::from_file(mod_id, f, l.slug.clone()));
                 }
             }
             Err(e) => warnings.push(format!("curseforge cross: {e}")),
@@ -484,25 +558,7 @@ async fn resolve_entry(
             Ok(versions) => {
                 let want = l.hashes.as_ref().and_then(|h| h.sha1.as_deref());
                 if let Some(v) = mr_version_matching(&versions, want) {
-                    mr_lock = Some(LockModrinth {
-                        slug: project.slug.clone(),
-                        project_id: project.id,
-                        version_id: v.id.clone(),
-                        version: v.name.clone(),
-                        filename: v.filename.clone(),
-                        url: v.url.clone(),
-                        size: v.size,
-                        hashes: LockHashes::new(v.sha1.clone(), v.sha512.clone(), None),
-                        dependencies: v
-                            .dependencies
-                            .iter()
-                            .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
-                            .map(|d| LockDep {
-                                id: d.project_id.clone(),
-                                optional: d.kind == DepKind::Optional,
-                            })
-                            .collect(),
-                    });
+                    mr_lock = Some(LockModrinth::from_version(&project, v));
                     if name.is_none() {
                         name = Some(project.title);
                     }
@@ -574,7 +630,7 @@ async fn resolve_modrinth(
     );
     let project = project.map_err(|e| format!("modrinth: {e}"))?;
     let versions = versions.map_err(|e| format!("modrinth: {e}"))?;
-    let requested = spec.version_for(true);
+    let requested = spec.version_for(true).filter(|v| !is_latest(v));
     // No requested version => latest (API returns newest first).
     let v = versions
         .iter()
@@ -589,29 +645,8 @@ async fn resolve_modrinth(
                 requested.unwrap_or_default()
             )
         })?;
-    Ok((
-        project.title,
-        v.name.clone(),
-        LockModrinth {
-            slug: project.slug,
-            project_id: project.id,
-            version_id: v.id.clone(),
-            version: v.name.clone(),
-            filename: v.filename.clone(),
-            url: v.url.clone(),
-            size: v.size,
-            hashes: LockHashes::new(v.sha1.clone(), v.sha512.clone(), None),
-            dependencies: v
-                .dependencies
-                .iter()
-                .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
-                .map(|d| LockDep {
-                    id: d.project_id.clone(),
-                    optional: d.kind == DepKind::Optional,
-                })
-                .collect(),
-        },
-    ))
+    let lock = LockModrinth::from_version(&project, v);
+    Ok((project.title, v.name.clone(), lock))
 }
 
 async fn resolve_curseforge(
@@ -623,16 +658,18 @@ async fn resolve_curseforge(
     loader: &str,
     is_mod: bool,
 ) -> Result<(String, String, LockCurseForge), String> {
-    let (mod_id, title) = match spec.curseforge_project_id() {
-        Some(pid) => (
+    let (mod_id, title) = if let Some(pid) = spec.curseforge_project_id() {
+        (
             i32::try_from(pid).map_err(|_| format!("curseforge: projectId {pid} out of range"))?,
             id.to_owned(),
-        ),
-        None => client
-            .find_by_slug(id, Some(class_id))
+        )
+    } else {
+        let slug = spec.curseforge_slug(id).unwrap_or_else(|| id.to_owned());
+        client
+            .find_by_slug(&slug, Some(class_id))
             .await
             .map_err(|e| format!("curseforge: {e}"))?
-            .ok_or_else(|| format!("curseforge: no project with slug \"{id}\""))?,
+            .ok_or_else(|| format!("curseforge: no project with slug \"{slug}\""))?
     };
     let loader_filter = if is_mod && !loader.is_empty() {
         Some(loader)
@@ -644,7 +681,7 @@ async fn resolve_curseforge(
         .get_files(mod_id, mc_filter, loader_filter)
         .await
         .map_err(|e| format!("curseforge: {e}"))?;
-    let requested = spec.version_for(false);
+    let requested = spec.version_for(false).filter(|v| !is_latest(v));
     let f = files
         .iter()
         .find(|f| {
@@ -661,25 +698,7 @@ async fn resolve_curseforge(
     Ok((
         title,
         f.display_name.clone(),
-        LockCurseForge {
-            project_id: i64::from(mod_id),
-            file_id: i64::from(f.id),
-            version: f.display_name.clone(),
-            filename: f.file_name.clone(),
-            url: cf_download_url(f),
-            size: f.file_length,
-            hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
-            dependencies: f
-                .dependencies
-                .iter()
-                .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
-                .map(|d| LockDep {
-                    id: d.project_id.clone(),
-                    optional: d.kind == DepKind::Optional,
-                })
-                .collect(),
-            slug: id.to_owned(),
-        },
+        LockCurseForge::from_file(mod_id, f, id.to_owned()),
     ))
 }
 
@@ -693,6 +712,7 @@ async fn resolve_dep_modrinth(
     loader: &str,
     want_cf: bool,
     cf: Option<Arc<CurseForgeClient>>,
+    warnings: &mut Vec<String>,
 ) -> Result<LockEntry, String> {
     let loader_filter = if loader.is_empty() {
         None
@@ -713,67 +733,35 @@ async fn resolve_dep_modrinth(
 
     // Cross-platform: try to find the same mod on CurseForge, matching the
     // chosen modrinth file by sha1 (names may differ between platforms).
+    // A missing counterpart is a warning, not a failure: the row is still
+    // pinned on modrinth.
     let cf_lock = if want_cf && let Some(client) = cf.as_ref() {
-        match client
-            .find_by_slug(&slug, Some(6))
-            .await
-            .map_err(|e| eprintln!("easypacker: cf lookup for dep {slug}: {e}"))
-        {
+        match client.find_by_slug(&slug, Some(6)).await {
             Ok(Some((mod_id, _))) => match client.get_files(mod_id, mc_filter, loader_filter).await
             {
-                Ok(files) => cf_file_matching(&files, v.sha1.as_deref()).map(|f| LockCurseForge {
-                    project_id: i64::from(mod_id),
-                    file_id: i64::from(f.id),
-                    version: f.display_name.clone(),
-                    filename: f.file_name.clone(),
-                    url: cf_download_url(f),
-                    size: f.file_length,
-                    hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
-                    dependencies: f
-                        .dependencies
-                        .iter()
-                        .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
-                        .map(|d| LockDep {
-                            id: d.project_id.clone(),
-                            optional: d.kind == DepKind::Optional,
-                        })
-                        .collect(),
-                    slug: slug.clone(),
-                }),
+                Ok(files) => cf_file_matching(&files, v.sha1.as_deref())
+                    .map(|f| LockCurseForge::from_file(mod_id, f, slug.clone())),
                 Err(e) => {
-                    eprintln!("easypacker: cf files for dep {slug}: {e}");
+                    warnings.push(format!("curseforge files for {slug}: {e}"));
                     None
                 }
             },
-            _ => None,
+            Ok(None) => None,
+            Err(e) => {
+                warnings.push(format!("curseforge lookup for {slug}: {e}"));
+                None
+            }
         }
     } else {
         None
     };
 
+    let mr_lock = LockModrinth::from_version(&project, v);
     Ok(LockEntry {
-        id: slug,
+        id: slug.clone(),
         name: project.title,
         version: v.name.clone(),
-        modrinth: Some(LockModrinth {
-            slug: project.slug,
-            project_id: project.id,
-            version_id: v.id.clone(),
-            version: v.name.clone(),
-            filename: v.filename.clone(),
-            url: v.url.clone(),
-            size: v.size,
-            hashes: LockHashes::new(v.sha1.clone(), v.sha512.clone(), None),
-            dependencies: v
-                .dependencies
-                .iter()
-                .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
-                .map(|d| LockDep {
-                    id: d.project_id.clone(),
-                    optional: d.kind == DepKind::Optional,
-                })
-                .collect(),
-        }),
+        modrinth: Some(mr_lock),
         curseforge: cf_lock,
     })
 }
@@ -787,6 +775,7 @@ async fn resolve_dep_curseforge(
     mc: &str,
     loader: &str,
     want_mr: bool,
+    warnings: &mut Vec<String>,
 ) -> Result<LockEntry, String> {
     let (mod_id, title, slug) = client
         .get_mod(dep_id)
@@ -822,31 +811,10 @@ async fn resolve_dep_curseforge(
         match ModrinthClient::get_project(&slug).await {
             Ok(project) => {
                 match ModrinthClient::get_versions(&slug, mc_filter, loader_filter).await {
-                    Ok(versions) => {
-                        mr_version_matching(&versions, f.sha1.as_deref()).map(|v| LockModrinth {
-                            slug: project.slug.clone(),
-                            project_id: project.id,
-                            version_id: v.id.clone(),
-                            version: v.name.clone(),
-                            filename: v.filename.clone(),
-                            url: v.url.clone(),
-                            size: v.size,
-                            hashes: LockHashes::new(v.sha1.clone(), v.sha512.clone(), None),
-                            dependencies: v
-                                .dependencies
-                                .iter()
-                                .filter(|d| {
-                                    d.kind == DepKind::Required || d.kind == DepKind::Optional
-                                })
-                                .map(|d| LockDep {
-                                    id: d.project_id.clone(),
-                                    optional: d.kind == DepKind::Optional,
-                                })
-                                .collect(),
-                        })
-                    }
+                    Ok(versions) => mr_version_matching(&versions, f.sha1.as_deref())
+                        .map(|v| LockModrinth::from_version(&project, v)),
                     Err(e) => {
-                        eprintln!("easypacker: mr versions for dep {slug}: {e}");
+                        warnings.push(format!("modrinth versions for {slug}: {e}"));
                         None
                     }
                 }
@@ -862,147 +830,95 @@ async fn resolve_dep_curseforge(
         name: title,
         version: f.display_name.clone(),
         modrinth: mr_lock,
-        curseforge: Some(LockCurseForge {
-            project_id: i64::from(mod_id),
-            file_id: i64::from(f.id),
-            version: f.display_name.clone(),
-            filename: f.file_name.clone(),
-            url: cf_download_url(f),
-            size: f.file_length,
-            hashes: LockHashes::new(f.sha1.clone(), None, f.md5.clone()),
-            dependencies: f
-                .dependencies
-                .iter()
-                .filter(|d| d.kind == DepKind::Required || d.kind == DepKind::Optional)
-                .map(|d| LockDep {
-                    id: d.project_id.clone(),
-                    optional: d.kind == DepKind::Optional,
-                })
-                .collect(),
-            slug: slug.clone(),
-        }),
+        curseforge: Some(LockCurseForge::from_file(mod_id, f, slug)),
     })
 }
 
-/// Resolve direct dependencies of manifest entries into their own lock rows.
-/// Required deps are always pinned; optional deps are pinned only when the
-/// Resolve direct dependencies of manifest entries into their own lock rows.
-/// Required deps are always pinned; optional deps are only included when the
-/// player enabled them (i.e. they're manifest entries, resolved separately).
-/// Each resolved dep row uses the easypacker id (modrinth/cf slug), tries
-/// both platforms the pack targets, and resolves the highest matching
-/// version. Deps already in the manifest (pinned by the player) are skipped
-/// here — the manifest entry covers them.
-/// ponytail: one level deep — full transitive closure would walk each dep's
-/// own deps; add a visited+BFS pass when the lockfile needs the full graph.
-async fn resolve_dependencies(
-    resolved: &mut BTreeMap<(&'static str, String), LockEntry>,
-    manifest_ids: &HashSet<String>,
-    mc: &str,
-    loader: &str,
+/// What the dependency resolver needs to know about the pack.
+struct DepContext<'a> {
+    mc: &'a str,
+    loader: &'a str,
     want_mr: bool,
     want_cf: bool,
     cf: Option<Arc<CurseForgeClient>>,
+}
+
+/// One dependency edge: the platform that declared it, the raw project id,
+/// and whether the parent called it optional (optional deps are pinned only
+/// when the player enabled them in the manifest).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct DepEdge {
+    platform: Platform,
+    id: String,
+    optional: bool,
+}
+
+/// Resolve the full transitive dependency graph of the manifest entries into
+/// lock rows (breadth-first, cycle-safe): each entry's required deps are
+/// resolved, and their required deps too, until nothing new appears.
+///
+/// Optional deps are pinned only when the player enabled them — they're then
+/// manifest entries and are resolved (with the player's pin) separately.
+/// Required deps already in the manifest keep the player's pin: the manifest
+/// always wins over the generated row. Incompatible relations are never
+/// pinned, but are reported when the other side ends up in the pack.
+async fn resolve_dependencies(
+    resolved: &mut BTreeMap<(&'static str, String), LockEntry>,
+    manifest_ids: &HashSet<String>,
+    ctx: DepContext<'_>,
+    warnings: &mut Vec<String>,
 ) -> Vec<LockEntry> {
-    // Gather (platform, raw dep_id, optional) edges across all resolved entries.
-    let mut edges: Vec<(Platform, String, bool)> = Vec::new();
-    for e in resolved.values() {
-        if let Some(mr) = &e.modrinth {
-            for d in &mr.dependencies {
-                edges.push((Platform::Modrinth, d.id.clone(), d.optional));
-            }
-        }
-        if let Some(cf) = &e.curseforge {
-            for d in &cf.dependencies {
-                edges.push((Platform::CurseForge, d.id.clone(), d.optional));
-            }
-        }
-    }
-    edges.sort_by(|a, b| a.1.cmp(&b.1));
-    edges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-    if edges.is_empty() {
+    let mut queue: std::collections::VecDeque<DepEdge> = edges_of(resolved.values());
+    if queue.is_empty() {
         return Vec::new();
     }
+    // A malformed graph (every dep depending on every other) must not spin
+    // forever; the visited set already stops cycles, this bounds the walk.
+    let max = (2 * queue.len()).max(256);
 
-    let mut seen: HashSet<(Platform, String)> = HashSet::new();
-    let mut set = tokio::task::JoinSet::new();
-    for (platform, dep_id, optional) in &edges {
-        if !seen.insert((*platform, dep_id.clone())) {
-            continue;
-        }
-        let id_str = dep_id.clone();
-        let optional = *optional;
-        match platform {
-            Platform::Modrinth => {
-                if !want_mr {
-                    continue;
-                }
-                let mc = mc.to_owned();
-                let loader = loader.to_owned();
-                let cf = cf.clone();
-                set.spawn(async move {
-                    (
-                        Platform::Modrinth,
-                        id_str.clone(),
-                        optional,
-                        resolve_dep_modrinth(&id_str, &mc, &loader, want_cf, cf).await,
-                    )
-                });
-            }
-            Platform::CurseForge => {
-                let Some(ref client) = cf else { continue };
-                if !want_cf {
-                    continue;
-                }
-                let Ok(mod_id) = dep_id.parse::<i32>() else {
-                    continue;
-                };
-                let client = client.clone();
-                let mc = mc.to_owned();
-                let loader = loader.to_owned();
-                set.spawn(async move {
-                    (
-                        Platform::CurseForge,
-                        id_str.clone(),
-                        optional,
-                        resolve_dep_curseforge(&client, mod_id, &mc, &loader, want_mr).await,
-                    )
-                });
-            }
-        }
-    }
-
-    // raw id -> slug for every resolved dep (even ones we drop), so edges
-    // can be rewritten to readable easypacker ids.
+    // raw id -> easypacker slug for every dep that resolved, so edges can be
+    // rewritten to readable ids even for deps that don't become lock rows.
     let mut slug_of: std::collections::HashMap<(Platform, String), String> =
         std::collections::HashMap::new();
+    let mut seen: HashSet<DepEdge> = HashSet::new();
     let mut out: Vec<LockEntry> = Vec::new();
     let mut out_slugs: HashSet<String> = HashSet::new();
-    while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok((platform, raw_id, optional, Ok(entry))) => {
-                let slug = entry.id.clone();
-                slug_of.insert((platform, raw_id.clone()), slug.clone());
-                // Optional deps are only added when the player enabled them,
-                // which writes them into the manifest (resolved separately).
-                if optional && !manifest_ids.contains(&slug) {
-                    continue;
-                }
-                if !out_slugs.insert(slug.clone()) {
-                    continue;
-                }
-                if manifest_ids.contains(&slug) {
-                    continue; // already a manifest entry (resolved separately)
-                }
-                out.push(entry);
-            }
-            Ok((_, _, _, Err(e))) => eprintln!("easypacker: {e}"),
-            Err(e) => eprintln!("easypacker: dep task failed: {e}"),
+
+    while let Some(edge) = queue.pop_front() {
+        if !seen.insert(edge.clone()) {
+            continue;
         }
+        if seen.len() > max {
+            warnings.push(format!(
+                "dependency graph larger than {max} edges — stopping the walk here"
+            ));
+            break;
+        }
+        let Some(entry) = resolve_dep_edge(&edge, &ctx, warnings).await else {
+            continue;
+        };
+        let slug = entry.id.clone();
+        slug_of.insert((edge.platform, edge.id.clone()), slug.clone());
+        // The manifest wins: a pinned manifest entry is never duplicated as a
+        // generated row (and its own deps come from its own resolution).
+        if manifest_ids.contains(&slug) {
+            continue;
+        }
+        // An optional dep the player didn't enable is not in the pack, and
+        // neither are its own deps.
+        if edge.optional {
+            continue;
+        }
+        // Walk this dep's own required deps (the transitive step).
+        queue.extend(edges_of(std::iter::once(&entry)));
+        if !out_slugs.insert(slug) {
+            continue; // already added (reached through a different id)
+        }
+        out.push(entry);
     }
 
-    // Rewrite each manifest entry's dep edges: raw id -> slug, and keep only
-    // deps that are either a manifest entry or a kept dep row.
+    // Rewrite every entry's dep edges: raw id -> slug, keeping only required
+    // deps that are actually in the pack (manifest entry or generated row).
     let known: HashSet<String> = manifest_ids.iter().cloned().chain(out_slugs).collect();
     for e in resolved.values_mut() {
         rewrite_edges(e, &slug_of, &known);
@@ -1011,9 +927,119 @@ async fn resolve_dependencies(
         rewrite_edges(e, &slug_of, &known);
     }
 
+    // A declared-incompatible project that made it into the pack anyway is
+    // worth telling the player about — it usually means a broken pairing.
+    let mut conflicts: Vec<String> = Vec::new();
+    for e in resolved.values().chain(out.iter()) {
+        for deps in [
+            e.modrinth.as_ref().map(|m| &m.dependencies),
+            e.curseforge.as_ref().map(|c| &c.dependencies),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for d in deps
+                .iter()
+                .filter(|d| d.incompatible && known.contains(&d.id))
+            {
+                conflicts.push(format!(
+                    "{} is declared incompatible with {} — both are in the pack",
+                    e.id, d.id
+                ));
+            }
+        }
+    }
+    conflicts.sort();
+    conflicts.dedup();
+    warnings.extend(conflicts);
+
     // Stable order by id for reproducible lockfiles.
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
+}
+
+/// Every dependency edge declared by the given entries (required, optional
+/// and incompatible), deduplicated in a stable order.
+fn edges_of<'a>(
+    entries: impl Iterator<Item = &'a LockEntry>,
+) -> std::collections::VecDeque<DepEdge> {
+    let mut edges: Vec<DepEdge> = Vec::new();
+    for e in entries {
+        for (platform, deps) in [
+            (
+                Platform::Modrinth,
+                e.modrinth.as_ref().map(|p| p.dependencies.as_slice()),
+            ),
+            (
+                Platform::CurseForge,
+                e.curseforge.as_ref().map(|p| p.dependencies.as_slice()),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(p, d)| d.map(|d| (p, d)))
+        {
+            for d in deps.iter().filter(|d| !d.incompatible) {
+                edges.push(DepEdge {
+                    platform,
+                    id: d.id.clone(),
+                    optional: d.optional,
+                });
+            }
+        }
+    }
+    edges.sort_by(|a, b| a.id.cmp(&b.id));
+    edges.dedup();
+    edges.into()
+}
+
+/// Resolve one edge into a lock row on its own platform, attaching the
+/// counterpart platform by sha1 when the pack targets both.
+async fn resolve_dep_edge(
+    edge: &DepEdge,
+    ctx: &DepContext<'_>,
+    warnings: &mut Vec<String>,
+) -> Option<LockEntry> {
+    match edge.platform {
+        Platform::Modrinth => {
+            if !ctx.want_mr {
+                return None;
+            }
+            match resolve_dep_modrinth(
+                &edge.id,
+                ctx.mc,
+                ctx.loader,
+                ctx.want_cf,
+                ctx.cf.clone(),
+                warnings,
+            )
+            .await
+            {
+                Ok(entry) => Some(entry),
+                Err(e) => {
+                    warnings.push(e);
+                    None
+                }
+            }
+        }
+        Platform::CurseForge => {
+            if !ctx.want_cf {
+                return None;
+            }
+            let client = ctx.cf.as_ref()?;
+            let Ok(mod_id) = edge.id.parse::<i32>() else {
+                return None;
+            };
+            match resolve_dep_curseforge(client, mod_id, ctx.mc, ctx.loader, ctx.want_mr, warnings)
+                .await
+            {
+                Ok(entry) => Some(entry),
+                Err(e) => {
+                    warnings.push(e);
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// Rewrite an entry's dependency ids from raw project ids to easypacker slugs,
@@ -1025,43 +1051,45 @@ fn rewrite_edges(
     known: &HashSet<String>,
 ) {
     if let Some(mr) = &mut e.modrinth {
-        mr.dependencies = mr
-            .dependencies
-            .iter()
-            .filter_map(|d| {
-                if d.optional {
-                    return None;
-                }
-                let slug = slug_of
-                    .get(&(Platform::Modrinth, d.id.clone()))
-                    .cloned()
-                    .unwrap_or_else(|| d.id.clone());
-                known.contains(&slug).then_some(LockDep {
-                    id: slug,
-                    optional: false,
-                })
-            })
-            .collect();
+        rewrite_deps(&mut mr.dependencies, Platform::Modrinth, slug_of, known);
     }
     if let Some(cf) = &mut e.curseforge {
-        cf.dependencies = cf
-            .dependencies
-            .iter()
-            .filter_map(|d| {
-                if d.optional {
-                    return None;
-                }
-                let slug = slug_of
-                    .get(&(Platform::CurseForge, d.id.clone()))
-                    .cloned()
-                    .unwrap_or_else(|| d.id.clone());
-                known.contains(&slug).then_some(LockDep {
-                    id: slug,
-                    optional: false,
-                })
-            })
-            .collect();
+        rewrite_deps(&mut cf.dependencies, Platform::CurseForge, slug_of, known);
     }
+}
+
+/// Rewrite one dependency list from raw project ids to easypacker slugs,
+/// keeping only required deps that are actually in the pack. Optional and
+/// incompatible relations never become lock edges.
+fn rewrite_deps(
+    deps: &mut Vec<LockDep>,
+    platform: Platform,
+    slug_of: &std::collections::HashMap<(Platform, String), String>,
+    known: &HashSet<String>,
+) {
+    *deps = deps
+        .iter()
+        .filter(|d| !d.optional && !d.incompatible)
+        .map(|d| {
+            let id = slug_of
+                .get(&(platform, d.id.clone()))
+                .cloned()
+                .unwrap_or_else(|| d.id.clone());
+            LockDep {
+                id,
+                optional: false,
+                incompatible: false,
+            }
+        })
+        .filter(|d| known.contains(&d.id))
+        .collect();
+}
+
+/// The dependency ids a list pins (incompatible relations are not pins).
+fn pinned_ids(deps: &[LockDep]) -> impl Iterator<Item = String> + '_ {
+    deps.iter()
+        .filter(|d| !d.incompatible)
+        .map(|d| d.id.clone())
 }
 
 /// Render fields as a multi-line inline table (TOML 1.1), e.g.
@@ -1117,15 +1145,19 @@ fn render(lock: &Lock) -> String {
             writeln!(out, "\n[[{cat}]]").unwrap();
             writeln!(out, "id = {}", tstr(&e.id)).unwrap();
             writeln!(out, "name = {}", tstr(&e.name)).unwrap();
+            // `version` is the shared pin; a platform only repeats its own
+            // name when it differs from it (they usually don't).
             writeln!(out, "version = {}", tstr(&e.version)).unwrap();
             if let Some(mr) = &e.modrinth {
                 let mut fields = vec![
                     format!("slug = {}", tstr(&mr.slug)),
                     format!("project_id = {}", tstr(&mr.project_id)),
                     format!("version_id = {}", tstr(&mr.version_id)),
-                    format!("version = {}", tstr(&mr.version)),
-                    format!("filename = {}", tstr(&mr.filename)),
                 ];
+                if mr.version != e.version {
+                    fields.push(format!("version = {}", tstr(&mr.version)));
+                }
+                fields.push(format!("filename = {}", tstr(&mr.filename)));
                 if let Some(url) = &mr.url {
                     fields.push(format!("url = {}", tstr(url)));
                 }
@@ -1139,9 +1171,11 @@ fn render(lock: &Lock) -> String {
                 let mut fields = vec![
                     format!("project_id = {}", cf.project_id),
                     format!("file_id = {}", cf.file_id),
-                    format!("version = {}", tstr(&cf.version)),
-                    format!("filename = {}", tstr(&cf.filename)),
                 ];
+                if cf.version != e.version {
+                    fields.push(format!("version = {}", tstr(&cf.version)));
+                }
+                fields.push(format!("filename = {}", tstr(&cf.filename)));
                 if let Some(url) = &cf.url {
                     fields.push(format!("url = {}", tstr(url)));
                 }
@@ -1170,10 +1204,10 @@ fn render(lock: &Lock) -> String {
 fn collect_dep_ids(e: &LockEntry) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     if let Some(mr) = &e.modrinth {
-        ids.extend(mr.dependencies.iter().map(|d| d.id.clone()));
+        ids.extend(pinned_ids(&mr.dependencies));
     }
     if let Some(cf) = &e.curseforge {
-        ids.extend(cf.dependencies.iter().map(|d| d.id.clone()));
+        ids.extend(pinned_ids(&cf.dependencies));
     }
     ids.sort();
     ids.dedup();

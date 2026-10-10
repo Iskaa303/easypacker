@@ -328,15 +328,18 @@ impl CurseForgeClient {
                         .dependencies
                         .into_iter()
                         .filter_map(|d| {
+                            // 1 embedded library, 4 tool, 6 include: shipped
+                            // inside the file itself, nothing to pin.
+                            let kind = match d.relation_type {
+                                1 | 4 | 6 => return None,
+                                2 => DepKind::Optional,
+                                5 => DepKind::Incompatible,
+                                _ => DepKind::Required,
+                            };
                             d.mod_id.map(|mid| Dependency {
                                 project_id: mid.to_string(),
                                 version_id: None,
-                                kind: match d.relation_type {
-                                    2 => DepKind::Optional,
-                                    5 => DepKind::Incompatible,
-                                    // 1 (embedded), 3 (required), 4 (tool), 6 (include)
-                                    _ => DepKind::Required,
-                                },
+                                kind,
                                 platform: Platform::CurseForge,
                             })
                         })

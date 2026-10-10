@@ -21,6 +21,7 @@ fn sample_lock() -> Lock {
                 dependencies: vec![LockDep {
                     id: "citadel".into(),
                     optional: false,
+                    incompatible: false,
                 }],
             }),
             curseforge: Some(LockCurseForge {
@@ -96,6 +97,81 @@ fn render_omits_missing_url_and_hashes() {
 }
 
 #[test]
+fn render_hoists_version_shared_by_both_platforms() {
+    let mut lock = sample_lock();
+    let entry = &mut lock.mod_[0];
+    let shared = "Sodium 0.8.12".to_owned();
+    entry.version = shared.clone();
+    entry.modrinth.as_mut().unwrap().version = shared.clone();
+    entry.curseforge.as_mut().unwrap().version = shared;
+    let out = render(&lock);
+    // One `version` at entry level; the platform tables must not repeat it.
+    let mr_block = out
+        .split("modrinth = ")
+        .nth(1)
+        .unwrap()
+        .split("curseforge = ")
+        .next()
+        .unwrap();
+    let cf_block = out.split("curseforge = ").nth(1).unwrap();
+    assert!(
+        !mr_block.contains("version = "),
+        "mr repeats version:\n{out}"
+    );
+    assert!(
+        !cf_block.contains("version = "),
+        "cf repeats version:\n{out}"
+    );
+    assert!(out.contains("\nversion = \"Sodium 0.8.12\"\n"), "{out}");
+    // Still valid TOML and the entry keeps the shared pin.
+    let parsed: toml::Value = toml::from_str(&out).unwrap();
+    assert_eq!(parsed["mod"][0]["version"].as_str(), Some("Sodium 0.8.12"));
+}
+
+#[test]
+fn render_keeps_platform_versions_when_they_differ() {
+    let out = render(&sample_lock());
+    let mr_block = out
+        .split("modrinth = ")
+        .nth(1)
+        .unwrap()
+        .split("curseforge = ")
+        .next()
+        .unwrap();
+    assert!(
+        mr_block.contains("version = \"Sodium 0.8.12\""),
+        "differing mr version dropped:\n{out}"
+    );
+    let cf_block = out.split("curseforge = ").nth(1).unwrap();
+    assert!(
+        cf_block.contains("version = \"Sodium 0.8.12\""),
+        "differing cf version dropped:\n{out}"
+    );
+}
+
+#[test]
+fn read_known_ids_and_version_from_rendered_lock() {
+    // The TUI marks in-pack mods and their pinned versions from these
+    // lookups; they must understand the current lockfile format.
+    let dir = std::env::temp_dir().join(format!("easypacker-lock-read-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(LOCK_FILE), render(&sample_lock())).unwrap();
+    let (slugs, cf_ids) = read_known_ids(&dir);
+    assert!(slugs.contains("sodium"));
+    assert!(cf_ids.contains(&394_468));
+    assert_eq!(
+        read_lock_version(&dir, Some("sodium"), None).as_deref(),
+        Some("Sodium 0.8.12 for NeoForge 1.21.1")
+    );
+    assert_eq!(
+        read_lock_version(&dir, None, Some(394_468)).as_deref(),
+        Some("Sodium 0.8.12 for NeoForge 1.21.1")
+    );
+    assert_eq!(read_lock_version(&dir, Some("missing"), None), None);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn rewrite_edges_keeps_required_only_and_rewrites_to_slugs() {
     let mut entry = LockEntry {
         id: "tfc".into(),
@@ -114,10 +190,12 @@ fn rewrite_edges_keeps_required_only_and_rewrites_to_slugs() {
                 LockDep {
                     id: "nU0bVIaL".into(),
                     optional: false,
+                    incompatible: false,
                 }, // patchouli, required
                 LockDep {
                     id: "someopt".into(),
                     optional: true,
+                    incompatible: false,
                 }, // optional -> dropped
             ],
         }),
@@ -134,6 +212,57 @@ fn rewrite_edges_keeps_required_only_and_rewrites_to_slugs() {
     assert_eq!(deps.len(), 1);
     assert_eq!(deps[0].id, "patchouli");
     assert!(!deps[0].optional);
+}
+
+#[test]
+fn edges_of_skips_incompatible_and_dedups() {
+    let dep = |id: &str, optional: bool, incompatible: bool| LockDep {
+        id: id.into(),
+        optional,
+        incompatible,
+    };
+    let entry = LockEntry {
+        id: "create".into(),
+        name: "Create".into(),
+        version: "1.0".into(),
+        modrinth: Some(LockModrinth {
+            slug: "create".into(),
+            project_id: "pid".into(),
+            version_id: "vid".into(),
+            version: "1.0".into(),
+            filename: "create.jar".into(),
+            url: None,
+            size: 1,
+            hashes: None,
+            dependencies: vec![
+                dep("flywheel", false, false),
+                dep("old-create", false, true),
+                dep("optional-thing", true, false),
+            ],
+        }),
+        curseforge: Some(LockCurseForge {
+            project_id: 1,
+            file_id: 2,
+            version: "1.0".into(),
+            filename: "create.jar".into(),
+            url: None,
+            size: 1,
+            hashes: None,
+            // Same required dep on the other platform: one edge, not two.
+            dependencies: vec![dep("flywheel", false, false)],
+            slug: "create".into(),
+        }),
+    };
+    let edges: Vec<_> = edges_of(std::iter::once(&entry)).into();
+    let ids: Vec<&str> = edges.iter().map(|e| e.id.as_str()).collect();
+    // Incompatible relations are never walked. The same dep declared on both
+    // platforms stays two edges (each side is resolved, then the rows collapse
+    // by slug), while a repeat on one platform would collapse.
+    assert_eq!(ids, vec!["flywheel", "flywheel", "optional-thing"]);
+    assert_eq!(edges[0].platform, Platform::Modrinth);
+    assert_eq!(edges[1].platform, Platform::CurseForge);
+    assert!(!edges[0].optional);
+    assert!(edges[2].optional);
 }
 
 #[test]
@@ -154,6 +283,7 @@ fn rewrite_edges_drops_unknown_deps() {
             dependencies: vec![LockDep {
                 id: "unknown".into(),
                 optional: false,
+                incompatible: false,
             }],
         }),
         curseforge: None,

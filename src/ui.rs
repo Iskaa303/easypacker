@@ -717,6 +717,26 @@ pub fn handle_form_key(form: &mut FormState, key: KeyCode) -> FormAction {
             }
             KeyCode::Char('s') => FormAction::Save,
             KeyCode::Char('q') => FormAction::Cancel,
+            // Typing on an unfocused text field starts editing it and keeps
+            // the character, so text is never silently dropped.
+            KeyCode::Char(c) => {
+                if matches!(form.fields[form.selected].kind, FieldKind::Text) {
+                    form.focused = true;
+                    form.cursor_pos = form.fields[form.selected].value.len();
+                    form.fields[form.selected].value.insert(form.cursor_pos, c);
+                    form.cursor_pos += 1;
+                }
+                FormAction::None
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                if matches!(form.fields[form.selected].kind, FieldKind::Text) {
+                    form.focused = true;
+                    form.cursor_pos = form.fields[form.selected].value.len();
+                    form.fields[form.selected].value.pop();
+                    form.cursor_pos = form.fields[form.selected].value.len();
+                }
+                FormAction::None
+            }
             _ => FormAction::None,
         }
     }

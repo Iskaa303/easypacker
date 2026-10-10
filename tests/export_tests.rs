@@ -643,6 +643,7 @@ async fn cf_export_rejects_missing_cf_pins() {
             curseforge: Some(CurseForgeSpec {
                 project_id: Some(394_468),
                 version: None,
+                ..Default::default()
             }),
             side: None,
         }),
@@ -717,6 +718,7 @@ fn sided_manifest() -> Manifest {
             curseforge: Some(CurseForgeSpec {
                 project_id: Some(394_468),
                 version: None,
+                ..Default::default()
             }),
             side: Some(Side::Client),
         }),
@@ -732,6 +734,7 @@ fn sided_manifest() -> Manifest {
             curseforge: Some(CurseForgeSpec {
                 project_id: Some(302_973),
                 version: None,
+                ..Default::default()
             }),
             side: None,
         }),

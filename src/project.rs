@@ -7,9 +7,19 @@ use std::path::Path;
 
 pub const MANIFEST_FILE: &str = "Easypacker.toml";
 
-/// Easypacker.toml — the hand-editable manifest (cargo-style).
-/// Parsing is serde; writing is a custom renderer so entries stay
-/// single-line inline tables (`sodium = { modrinth = {...}, ... }`).
+/// Version string meaning "newest version matching the pack's minecraft /
+/// loader" — what an entry without a `version` resolves to.
+pub const LATEST: &str = "latest";
+
+/// Is this the `latest` marker (case-insensitive)?
+pub const fn is_latest(v: &str) -> bool {
+    v.eq_ignore_ascii_case(LATEST)
+}
+
+/// Easypacker.toml — the hand-editable manifest (cargo-style). Parsing is
+/// serde (with short forms: `slugs = "1.2.3"`, `modrinth = true`,
+/// `curseforge = 394468`); writing is a custom renderer that picks the
+/// shortest equivalent form for every entry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     pub project: ModpackProject,
@@ -103,10 +113,11 @@ pub enum ModSpec {
     Detailed(DetailedSpec),
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct DetailedSpec {
     /// Shared version display name — inherited by every platform below that
-    /// doesn't override it with its own `version`.
+    /// doesn't override it with its own `version`. `"latest"` (or omitting
+    /// it) means the newest matching version.
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -119,20 +130,100 @@ pub struct DetailedSpec {
     pub side: Option<Side>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+/// Modrinth identity, written in whichever form is shortest:
+/// `modrinth = true` (slug is the key), `modrinth = "some-slug"`, or
+/// `modrinth = { slug = "some-slug", version = "1.2.3" }` when the version
+/// differs from the shared one.
+#[derive(Debug, Clone, Default)]
 pub struct ModrinthSpec {
-    #[serde(default)]
     pub slug: Option<String>,
-    #[serde(default)]
     pub version: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+/// `CurseForge` identity: `curseforge = true` (slug is the key),
+/// `curseforge = 394468` (project id), `curseforge = "some-slug"`, or a full
+/// `{ projectId = ..., slug = ..., version = ... }` table.
+#[derive(Debug, Clone, Default)]
 pub struct CurseForgeSpec {
-    #[serde(default, rename = "projectId")]
     pub project_id: Option<i64>,
-    #[serde(default)]
+    /// `CurseForge` slug when it differs from the manifest key.
+    pub slug: Option<String>,
     pub version: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ModrinthSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Flag(bool),
+            Slug(String),
+            Table {
+                slug: Option<String>,
+                version: Option<String>,
+            },
+        }
+        Ok(match Repr::deserialize(d)? {
+            Repr::Flag(true) => Self::default(),
+            // `false` would be a second way to say "no modrinth"; leaving the
+            // key out already says that, so point at the one true spelling.
+            Repr::Flag(false) => {
+                return Err(serde::de::Error::custom(
+                    "modrinth = false is not a thing — remove the key to drop the platform",
+                ));
+            }
+            Repr::Slug(slug) => Self {
+                slug: Some(slug),
+                version: None,
+            },
+            Repr::Table { slug, version } => Self { slug, version },
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for CurseForgeSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Flag(bool),
+            Id(i64),
+            Slug(String),
+            Table {
+                #[serde(rename = "projectId")]
+                project_id: Option<i64>,
+                slug: Option<String>,
+                version: Option<String>,
+            },
+        }
+        Ok(match Repr::deserialize(d)? {
+            Repr::Flag(true) => Self::default(),
+            Repr::Flag(false) => {
+                return Err(serde::de::Error::custom(
+                    "curseforge = false is not a thing — remove the key to drop the platform",
+                ));
+            }
+            Repr::Id(project_id) => Self {
+                project_id: Some(project_id),
+                slug: None,
+                version: None,
+            },
+            Repr::Slug(slug) => Self {
+                project_id: None,
+                slug: Some(slug),
+                version: None,
+            },
+            Repr::Table {
+                project_id,
+                slug,
+                version,
+            } => Self {
+                project_id,
+                slug,
+                version,
+            },
+        })
+    }
 }
 
 impl ModSpec {
@@ -177,19 +268,32 @@ impl ModSpec {
         }
     }
 
-    /// A `Simple` spec targets all platforms.
-    /// A `Detailed` spec targets only platforms it explicitly names.
+    /// `CurseForge` slug to look the project up by: the explicit slug when
+    /// given, otherwise the manifest key. `None` when the spec doesn't target
+    /// `CurseForge` at all.
+    pub fn curseforge_slug(&self, key: &str) -> Option<String> {
+        let cf = match self {
+            Self::Simple(_) => return Some(key.to_owned()),
+            Self::Detailed(d) => d.curseforge.as_ref()?,
+        };
+        Some(cf.slug.clone().unwrap_or_else(|| key.to_owned()))
+    }
+
+    /// Which platforms an entry is on: the string form and a table that names
+    /// no platform at all target every platform the pack targets; a table
+    /// that names platforms targets exactly those (so `{ curseforge = 123 }`
+    /// is `CurseForge`-only).
     pub const fn has_modrinth(&self) -> bool {
         match self {
             Self::Simple(_) => true,
-            Self::Detailed(d) => d.modrinth.is_some(),
+            Self::Detailed(d) => d.modrinth.is_some() || d.curseforge.is_none(),
         }
     }
 
     pub const fn has_curseforge(&self) -> bool {
         match self {
             Self::Simple(_) => true,
-            Self::Detailed(d) => d.curseforge.is_some(),
+            Self::Detailed(d) => d.curseforge.is_some() || d.modrinth.is_none(),
         }
     }
 
@@ -349,7 +453,8 @@ impl Manifest {
     /// Render back to TOML. Detailed entries become single-line inline
     /// tables; simple string entries stay plain strings.
     pub fn render(&self) -> String {
-        let mut o = String::from("[project]\n");
+        let mut o = String::new();
+        o.push_str("[project]\n");
         let p = &self.project;
         writeln!(o, "name = {}", tstr(&p.name)).unwrap();
         writeln!(o, "version = {}", tstr(&p.version)).unwrap();
@@ -391,7 +496,7 @@ impl Manifest {
             }
             for (k, v) in map.iter() {
                 if let ModSpec::Detailed(d) = v {
-                    writeln!(o, "{} = {}", tkey(k), render_spec(d)).unwrap();
+                    writeln!(o, "{} = {}", tkey(k), render_spec(k, d)).unwrap();
                 }
             }
         }
@@ -399,35 +504,102 @@ impl Manifest {
     }
 }
 
-fn render_spec(d: &DetailedSpec) -> String {
+/// Render one detailed spec in the shortest form that means the same thing:
+/// `sodium = "0.8.13"` when both platforms use the key as their slug,
+/// otherwise a table with only the keys that carry information —
+/// `{ version = "0.8.13", modrinth = true, curseforge = 394468 }`,
+/// `{ curseforge = 482378 }` for a `CurseForge`-only mod, or
+/// `{ modrinth = "other-slug", version = "1.2.3" }`.
+fn render_spec(key: &str, d: &DetailedSpec) -> String {
+    let mr_ver = d.modrinth.as_ref().and_then(|m| m.version.as_deref());
+    let cf_ver = d.curseforge.as_ref().and_then(|c| c.version.as_deref());
+    let hoisted = match (d.version.as_deref(), mr_ver, cf_ver) {
+        (Some(v), _, _) => Some(v),
+        (None, Some(a), Some(b)) if a == b => Some(a),
+        _ => None,
+    };
+
+    // Both platforms, default identities, no forced side: the plain string
+    // form. Unpinned writes `"latest"` so the intent is visible. Naming no
+    // platform at all also means "both", so `{ version = "1.0" }` normalizes
+    // to `"1.0"` instead of staying a longer spelling of the same thing.
+    let implied = d.modrinth.is_none() && d.curseforge.is_none();
+    let mr_default = d
+        .modrinth
+        .as_ref()
+        .is_none_or(|m| m.version.is_none() && m.slug.as_deref().is_none_or(|s| s == key));
+    let cf_default = d.curseforge.as_ref().is_none_or(|c| {
+        c.version.is_none() && c.project_id.is_none() && c.slug.as_deref().is_none_or(|s| s == key)
+    });
+    if (implied || (d.modrinth.is_some() && d.curseforge.is_some()))
+        && mr_default
+        && cf_default
+        && d.side.is_none()
+    {
+        return tstr(hoisted.unwrap_or(LATEST));
+    }
+
     let mut parts = Vec::new();
-    if let Some(mr) = &d.modrinth {
-        let mut inner = Vec::new();
-        if let Some(s) = &mr.slug {
-            inner.push(format!("slug = {}", tstr(s)));
-        }
-        if let Some(v) = &mr.version {
-            inner.push(format!("version = {}", tstr(v)));
-        }
-        parts.push(format!("modrinth = {{ {} }}", inner.join(", ")));
-    }
-    if let Some(cf) = &d.curseforge {
-        let mut inner = Vec::new();
-        if let Some(id) = cf.project_id {
-            inner.push(format!("projectId = {id}"));
-        }
-        if let Some(v) = &cf.version {
-            inner.push(format!("version = {}", tstr(v)));
-        }
-        parts.push(format!("curseforge = {{ {} }}", inner.join(", ")));
-    }
-    if let Some(v) = &d.version {
+    if let Some(v) = hoisted {
         parts.push(format!("version = {}", tstr(v)));
     }
     if let Some(s) = d.side {
         parts.push(format!("side = {}", tstr(s.as_str())));
     }
+    if let Some(mr) = &d.modrinth {
+        parts.push(render_modrinth(key, mr, hoisted));
+    }
+    if let Some(cf) = &d.curseforge {
+        parts.push(render_curseforge(key, cf, hoisted));
+    }
     format!("{{ {} }}", parts.join(", "))
+}
+
+/// A platform's own version is only written when it differs from the shared
+/// one (otherwise it inherits it).
+fn platform_version<'a>(version: Option<&'a str>, hoisted: Option<&str>) -> Option<&'a str> {
+    version.filter(|v| hoisted != Some(*v))
+}
+
+fn render_modrinth(key: &str, mr: &ModrinthSpec, hoisted: Option<&str>) -> String {
+    let version = platform_version(mr.version.as_deref(), hoisted);
+    let slug = mr.slug.as_deref().filter(|s| *s != key);
+    match (slug, version) {
+        (None, None) => "modrinth = true".to_owned(),
+        (Some(s), None) => format!("modrinth = {}", tstr(s)),
+        (slug, Some(v)) => {
+            let mut inner = Vec::new();
+            if let Some(s) = slug {
+                inner.push(format!("slug = {}", tstr(s)));
+            }
+            inner.push(format!("version = {}", tstr(v)));
+            format!("modrinth = {{ {} }}", inner.join(", "))
+        }
+    }
+}
+
+fn render_curseforge(key: &str, cf: &CurseForgeSpec, hoisted: Option<&str>) -> String {
+    let version = platform_version(cf.version.as_deref(), hoisted);
+    let slug = cf.slug.as_deref().filter(|s| *s != key);
+    if version.is_none() {
+        return match (cf.project_id, slug) {
+            (Some(id), None) => format!("curseforge = {id}"),
+            (None, Some(s)) => format!("curseforge = {}", tstr(s)),
+            (None, None) => "curseforge = true".to_owned(),
+            (Some(id), Some(s)) => {
+                format!("curseforge = {{ projectId = {id}, slug = {} }}", tstr(s))
+            }
+        };
+    }
+    let mut inner = Vec::new();
+    if let Some(id) = cf.project_id {
+        inner.push(format!("projectId = {id}"));
+    }
+    if let Some(s) = slug {
+        inner.push(format!("slug = {}", tstr(s)));
+    }
+    inner.push(format!("version = {}", tstr(version.unwrap_or_default())));
+    format!("curseforge = {{ {} }}", inner.join(", "))
 }
 
 /// Quote a string as a TOML basic string.

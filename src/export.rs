@@ -11,7 +11,7 @@
 //! promotions JSON, neoforge maven-metadata XML) since neither the toml nor
 //! the lockfile pins it.
 
-use crate::cli::Cli;
+use crate::cli::ExportArgs;
 use crate::project::{Manifest, Side, slugify, tstr};
 use color_eyre::eyre::{Result, bail};
 use serde::Deserialize;
@@ -968,8 +968,8 @@ pub async fn export_pack(
     })
 }
 
-pub async fn run_cli(args: &Cli) -> Result<()> {
-    let target = ExportTarget::parse(args.export.as_deref().unwrap_or("curseforge"))?;
+pub async fn run_cli(args: &ExportArgs) -> Result<()> {
+    let target = ExportTarget::parse(&args.target)?;
     let side = if args.server {
         ExportSide::Server
     } else {

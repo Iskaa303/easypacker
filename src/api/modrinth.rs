@@ -243,14 +243,18 @@ impl ModrinthClient {
                         .dependencies
                         .into_iter()
                         .filter_map(|d| {
+                            // "embedded" means the dependency ships inside
+                            // this file (a bundled library) — not ours to pin.
+                            let kind = match d.dependency_type.as_str() {
+                                "embedded" => return None,
+                                "optional" => DepKind::Optional,
+                                "incompatible" => DepKind::Incompatible,
+                                _ => DepKind::Required,
+                            };
                             d.project_id.map(|pid| Dependency {
                                 project_id: pid,
                                 version_id: d.version_id,
-                                kind: match d.dependency_type.as_str() {
-                                    "optional" => DepKind::Optional,
-                                    "incompatible" => DepKind::Incompatible,
-                                    _ => DepKind::Required,
-                                },
+                                kind,
                                 platform: Platform::Modrinth,
                             })
                         })
