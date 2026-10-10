@@ -167,7 +167,10 @@ pub enum AppEvent {
         options: Vec<String>,
         saved: HashSet<String>,
     },
-    IconLoaded(usize, Vec<u8>),
+    IconLoaded {
+        url: String,
+        bytes: Vec<u8>,
+    },
     LinkResults {
         results: Vec<SearchResult>,
     },

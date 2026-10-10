@@ -1,3 +1,4 @@
+use crate::api;
 use crate::api::types::{Platform, ProjectFile};
 use crate::app::App;
 use crate::config::Config;
@@ -18,7 +19,7 @@ use crossterm::terminal::{
 };
 use crossterm::tty::IsTty;
 use ratatui::Frame;
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::stdout;
@@ -29,11 +30,7 @@ pub fn run_tui(_cfg: Config, project: Option<project::Manifest>) -> Result<()> {
             "the TUI needs a terminal; in scripts use: easypacker search | init | add | remove | list | set | export"
         );
     }
-    // `Picker::from_query_stdio` asks the terminal and *reads stdin* while it
-    // waits for the answer, which swallows the first keys the user types and
-    // races our raw mode (it enables and disables it from a helper thread).
-    // Halfblocks renders these small icons fine without any of that.
-    let picker = Picker::halfblocks();
+    let picker = detect_picker();
 
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -64,7 +61,8 @@ pub fn run_tui(_cfg: Config, project: Option<project::Manifest>) -> Result<()> {
         filter_selected: 0,
         api_key_input: String::new(),
         picker,
-        proto_cache: Vec::new(),
+        icon_cache: std::collections::HashMap::new(),
+        icon_failed: HashSet::new(),
         mode,
         project,
         welcome_state: ui::WelcomeState::default(),
@@ -80,6 +78,13 @@ pub fn run_tui(_cfg: Config, project: Option<project::Manifest>) -> Result<()> {
         quit_requested: false,
     };
 
+    // Rebuild the lockfile in the background: starting the TUI must not wait
+    // for the network (a full resolve used to block the first frame for
+    // seconds).
+    if has_project {
+        spawn_lock_regen(std::env::current_dir().unwrap_or_default(), &tx);
+    }
+
     let res = run(&mut terminal, &mut app, &mut rx, &tx);
 
     disable_raw_mode()?;
@@ -92,6 +97,86 @@ pub fn run_tui(_cfg: Config, project: Option<project::Manifest>) -> Result<()> {
 
 /// The TUI event loop — draw, poll events, dispatch per mode. Long but a
 /// single linear loop; splitting it would scatter the dispatch table.
+/// Image protocol chosen by [`pick_protocol`] for this run.
+fn detect_picker() -> Picker {
+    let protocol = pick_protocol(&|k| std::env::var(k).ok());
+    // `from_fontsize` is the only constructor that takes a cell size (the
+    // querying one reads stdin, see `pick_protocol`).
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize(cell_size());
+    picker.set_protocol_type(protocol);
+    picker
+}
+
+/// Terminal cell size in pixels, from the tty's reported window size (no
+/// stdin involved). Falls back to the common 10x20 cell.
+fn cell_size() -> ratatui_image::FontSize {
+    let fallback = ratatui_image::FontSize::new(10, 20);
+    let Ok(ws) = crossterm::terminal::window_size() else {
+        return fallback;
+    };
+    if ws.columns == 0 || ws.rows == 0 || ws.width == 0 || ws.height == 0 {
+        return fallback;
+    }
+    #[allow(clippy::integer_division)]
+    ratatui_image::FontSize::new((ws.width / ws.columns).max(1), (ws.height / ws.rows).max(1))
+}
+
+/// Which graphics protocol the icons can actually use.
+///
+/// Detected from the environment rather than by querying stdio, because
+/// ratatui-image's query reads stdin while it waits and eats the first
+/// keystrokes (and races raw mode from a helper thread).
+///
+/// Inside Zellij we stay on halfblocks: Zellij rejects the unicode-placeholder
+/// placements that ratatui-image's Kitty protocol is built on
+/// (zellij-org/zellij#5530), it does not pass iTerm2 images through, and its
+/// Sixel support needs a host terminal that has Sixel — Ghostty does not.
+/// Running easypacker straight in kitty/Ghostty/WezTerm gives real images.
+fn pick_protocol(get: &dyn Fn(&str) -> Option<String>) -> ProtocolType {
+    let var = |k: &str| get(k).unwrap_or_default();
+    match var("EASYPACKER_IMAGES").to_lowercase().as_str() {
+        "kitty" => return ProtocolType::Kitty,
+        "sixel" => return ProtocolType::Sixel,
+        "iterm2" => return ProtocolType::Iterm2,
+        "halfblocks" | "off" => return ProtocolType::Halfblocks,
+        _ => {}
+    }
+    if !var("ZELLIJ").is_empty() {
+        return ProtocolType::Halfblocks;
+    }
+    let term = var("TERM").to_lowercase();
+    let prog = var("TERM_PROGRAM").to_lowercase();
+    // WezTerm and Konsole implement Kitty/Sixel imperfectly (ratatui-image's
+    // compatibility matrix), iTerm2 images work in both.
+    if !var("WEZTERM_EXECUTABLE").is_empty()
+        || !var("KONSOLE_VERSION").is_empty()
+        || prog == "wezterm"
+    {
+        return ProtocolType::Iterm2;
+    }
+    if prog == "iterm.app" || prog == "warp" || prog == "tabby" {
+        return ProtocolType::Iterm2;
+    }
+    if !var("KITTY_WINDOW_ID").is_empty()
+        || prog == "ghostty"
+        || prog == "kitty"
+        || term.contains("kitty")
+        || term.contains("ghostty")
+    {
+        return ProtocolType::Kitty;
+    }
+    if term.contains("foot") || term.contains("mlterm") || term.contains("sixel") {
+        return ProtocolType::Sixel;
+    }
+    ProtocolType::Halfblocks
+}
+
+/// `EASYPACKER_IMAGES=off` turns mod icons off entirely (no downloads).
+fn icons_enabled() -> bool {
+    !std::env::var("EASYPACKER_IMAGES").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
+}
+
 #[allow(clippy::too_many_lines)]
 fn run(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
@@ -298,28 +383,12 @@ fn run(
                         app.results = results;
                         app.scroll = 0;
                         app.selected = 0;
-                        app.proto_cache = vec![None; app.results.len()];
                     } else {
-                        let start = app.results.len();
                         app.results.extend(results);
-                        app.proto_cache
-                            .extend(vec![None; app.results.len() - start]);
                     }
                     app.status = Status::Done;
                     app.focus = Focus::Results;
-                    let tx = tx.clone();
-                    let urls: Vec<Option<String>> =
-                        app.results.iter().map(|r| r.icon_url.clone()).collect();
-                    tokio::spawn(async move {
-                        for (i, url) in urls.iter().enumerate() {
-                            if let Some(url) = url
-                                && let Ok(resp) = reqwest::get(url).await
-                                && let Ok(bytes) = resp.bytes().await
-                            {
-                                let _ = tx.send(AppEvent::IconLoaded(i, bytes.to_vec())).await;
-                            }
-                        }
-                    });
+                    spawn_icon_fetch(app, tx);
                 }
                 AppEvent::Error(msg) => {
                     if app.mode == AppMode::Search {
@@ -406,24 +475,27 @@ fn run(
                             .collect();
                     }
                 }
-                AppEvent::IconLoaded(i, bytes) => {
-                    if i < app.proto_cache.len() {
-                        match image::load_from_memory(&bytes) {
-                            Ok(dyn_img) => {
-                                let size = ratatui::prelude::Size::new(6, 2);
-                                match app.picker.new_protocol(
-                                    dyn_img,
-                                    size,
-                                    ratatui_image::Resize::Fit(None),
-                                ) {
-                                    Ok(proto) => app.proto_cache[i] = Some(proto),
-                                    Err(e) => eprintln!("protocol error for {i}: {e}"),
-                                }
+                AppEvent::IconLoaded { url, bytes } => match image::load_from_memory(&bytes) {
+                    Ok(dyn_img) => {
+                        let size = ratatui::prelude::Size::new(6, 2);
+                        match app.picker.new_protocol(
+                            dyn_img,
+                            size,
+                            ratatui_image::Resize::Fit(None),
+                        ) {
+                            Ok(proto) => {
+                                app.icon_cache.insert(url, proto);
                             }
-                            Err(e) => eprintln!("image decode error for {i}: {e}"),
+                            Err(e) => {
+                                app.icon_failed.insert(url);
+                                app.status = Status::Error(format!("icon: {e}"));
+                            }
                         }
                     }
-                }
+                    Err(_) => {
+                        app.icon_failed.insert(url);
+                    }
+                },
                 AppEvent::LinkResults { results } => {
                     if let Some(ref mut lv) = app.link_version {
                         lv.results = results;
@@ -662,6 +734,51 @@ fn open_link_version_popup(app: &mut App) {
         picked: None,
         status: None,
         searched_query: None,
+    });
+}
+
+/// Download every icon the current results need, in parallel, reusing the
+/// icons already decoded this session.
+///
+/// The old version downloaded them one by one with a fresh HTTP client per
+/// icon (a TLS handshake each) and re-downloaded everything on every search,
+/// so icons trickled in over several seconds and vanished on the next search.
+fn spawn_icon_fetch(app: &App, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+    if !icons_enabled() {
+        return;
+    }
+    let mut seen = HashSet::new();
+    let urls: Vec<String> = app
+        .results
+        .iter()
+        .filter_map(|r| r.icon_url.clone())
+        .filter(|u| !app.icon_cache.contains_key(u) && !app.icon_failed.contains(u))
+        .filter(|u| seen.insert(u.clone()))
+        .collect();
+    if urls.is_empty() {
+        return;
+    }
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        // A handful at a time: fast without hammering the CDNs.
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+        let mut set = tokio::task::JoinSet::new();
+        for url in urls {
+            let tx = tx.clone();
+            let permits = permits.clone();
+            set.spawn(async move {
+                let _permit = permits.acquire_owned().await.ok()?;
+                let resp = api::http().get(&url).send().await.ok()?;
+                let bytes = resp.bytes().await.ok()?;
+                tx.send(AppEvent::IconLoaded {
+                    url,
+                    bytes: bytes.to_vec(),
+                })
+                .await
+                .ok()
+            });
+        }
+        while set.join_next().await.is_some() {}
     });
 }
 
@@ -1659,5 +1776,64 @@ fn form_to_project(form: &ui::FormState) -> project::ModpackProject {
         minecraft,
         loader,
         platforms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn pick(vars: &[(&str, &str)]) -> ProtocolType {
+        let map: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        pick_protocol(&|k| map.get(k).cloned())
+    }
+
+    #[test]
+    fn zellij_keeps_halfblocks_even_under_ghostty() {
+        // The user-facing case: Ghostty under Zellij answers kitty, but Zellij
+        // rejects the unicode-placeholder placements the kitty protocol needs.
+        assert_eq!(
+            pick(&[
+                ("ZELLIJ", "0"),
+                ("TERM", "xterm-ghostty"),
+                ("TERM_PROGRAM", "ghostty"),
+            ]),
+            ProtocolType::Halfblocks
+        );
+    }
+
+    #[test]
+    fn picks_kitty_for_kitty_ghostty_and_iterm2_for_wezterm() {
+        assert_eq!(pick(&[("TERM", "xterm-ghostty")]), ProtocolType::Kitty);
+        assert_eq!(pick(&[("TERM_PROGRAM", "ghostty")]), ProtocolType::Kitty);
+        assert_eq!(pick(&[("TERM", "xterm-kitty")]), ProtocolType::Kitty);
+        assert_eq!(pick(&[("KITTY_WINDOW_ID", "1")]), ProtocolType::Kitty);
+        assert_eq!(
+            pick(&[("WEZTERM_EXECUTABLE", "/usr/bin/wezterm")]),
+            ProtocolType::Iterm2
+        );
+        assert_eq!(pick(&[("TERM_PROGRAM", "iTerm.app")]), ProtocolType::Iterm2);
+        assert_eq!(pick(&[("TERM", "foot")]), ProtocolType::Sixel);
+        assert_eq!(
+            pick(&[("TERM", "xterm-256color")]),
+            ProtocolType::Halfblocks
+        );
+    }
+
+    #[test]
+    fn explicit_protocol_wins_over_detection() {
+        // Also the escape hatch for terminals we guess wrong.
+        assert_eq!(
+            pick(&[("ZELLIJ", "0"), ("EASYPACKER_IMAGES", "Sixel")]),
+            ProtocolType::Sixel
+        );
+        assert_eq!(
+            pick(&[("TERM", "xterm-kitty"), ("EASYPACKER_IMAGES", "off")]),
+            ProtocolType::Halfblocks
+        );
     }
 }

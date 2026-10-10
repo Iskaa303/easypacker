@@ -305,6 +305,11 @@ pub fn read_lock_version(
 /// then render); splitting it into helpers would only scatter the flow.
 #[allow(clippy::too_many_lines)]
 pub async fn generate(dir: &Path, cfg: &Config) -> Result<Report> {
+    // One rebuild at a time per process: the TUI starts one in the background
+    // while a write action may start another, and both would race on the file.
+    static REGEN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = REGEN.lock().await;
+
     let manifest = Manifest::load(dir)?;
     let proj = &manifest.project;
 
@@ -429,7 +434,18 @@ pub async fn generate(dir: &Path, cfg: &Config) -> Result<Report> {
         shader: shaders,
     };
 
-    std::fs::write(dir.join(LOCK_FILE), render(&lock))?;
+    let text = render(&lock);
+    // Writing an identical file would only churn its mtime (a lockfile is
+    // tracked in git, and the TUI may rebuild it on every start).
+    let path = dir.join(LOCK_FILE);
+    if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
+        return Ok(Report {
+            resolved: resolved_count,
+            failed,
+            warnings,
+        });
+    }
+    std::fs::write(&path, text)?;
 
     Ok(Report {
         resolved: resolved_count,

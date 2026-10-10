@@ -219,13 +219,15 @@ pub async fn loader_version(mc: &str, loader: &str) -> Result<String> {
             first_loader_version(&format!("https://meta.quiltmc.org/v3/versions/loader/{mc}")).await
         }
         "forge" => {
-            let body = reqwest::get(
-                "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
-            )
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
+            let body = crate::api::http()
+                .get(
+                    "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
+                )
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
             let v: Value = serde_json::from_str(&body)?;
             let promos = &v["promos"];
             promos[format!("{mc}-latest").as_str()]
@@ -235,13 +237,13 @@ pub async fn loader_version(mc: &str, loader: &str) -> Result<String> {
                 .ok_or_else(|| color_eyre::eyre::eyre!("no forge build for {mc}"))
         }
         "neoforge" | "neo" => {
-            let body = reqwest::get(
-                "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml",
-            )
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
+            let body = crate::api::http()
+                .get("https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml")
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
             let prefix = neoforge_prefix(mc);
             extract_xml_versions(&body)
                 .into_iter()
@@ -254,7 +256,13 @@ pub async fn loader_version(mc: &str, loader: &str) -> Result<String> {
 }
 
 async fn first_loader_version(url: &str) -> Result<String> {
-    let body = reqwest::get(url).await?.error_for_status()?.text().await?;
+    let body = crate::api::http()
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     let v: Value = serde_json::from_str(&body)?;
     v[0]["loader"]["version"]
         .as_str()
@@ -946,17 +954,15 @@ pub async fn export_pack(
     }
     let loader = lock.loader.to_lowercase();
     let loader_ver = loader_version(&lock.minecraft, &loader).await?;
-    let http = reqwest::Client::new();
+    let http = crate::api::http();
     let out = match target {
         ExportTarget::CurseForge => {
-            export_curseforge(&pack, &lock, &loader, &loader_ver, side, &http).await?
+            export_curseforge(&pack, &lock, &loader, &loader_ver, side, http).await?
         }
         ExportTarget::Modrinth => {
-            export_modrinth(&pack, &lock, &loader, &loader_ver, side, &http).await?
+            export_modrinth(&pack, &lock, &loader, &loader_ver, side, http).await?
         }
-        ExportTarget::Prism => {
-            export_prism(&pack, &lock, &loader, &loader_ver, side, &http).await?
-        }
+        ExportTarget::Prism => export_prism(&pack, &lock, &loader, &loader_ver, side, http).await?,
     };
     warnings.extend(out.warnings);
     let path = write_pack(dir, &pack, target, &out.bytes)?;

@@ -7,6 +7,8 @@ use crate::cli::SearchArgs;
 use crate::config::Config;
 use color_eyre::eyre::Result;
 use std::io::Write;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 pub use curseforge::CurseForgeClient;
 pub use curseforge::CurseForgeFileInfo;
@@ -14,6 +16,21 @@ pub use modrinth::ModrinthClient;
 pub use modrinth::ModrinthProjectInfo;
 pub use modrinth::ModrinthVersionInfo;
 pub use types::{Platform, ProjectFile, SearchFilters, SearchResult};
+
+/// One pooled HTTP client for the whole process.
+///
+/// Every API call and icon download used to build its own client, which meant
+/// a fresh TCP connection and TLS handshake per request; sharing one client
+/// reuses the connections instead.
+pub fn http() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("building the HTTP client cannot fail")
+    })
+}
 
 pub async fn run_cli(args: &SearchArgs, cfg: &Config) -> Result<()> {
     let filters = SearchFilters {

@@ -2,7 +2,6 @@ use super::types::{CrossPlatform, DepKind, Dependency, Platform, SearchFilters, 
 use crate::api::filters;
 use color_eyre::eyre::Result;
 use serde::Deserialize;
-use std::time::Duration;
 
 const BASE: &str = "https://api.modrinth.com/v2";
 
@@ -108,9 +107,7 @@ impl ModrinthClient {
             }
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()?;
+        let client = super::http();
         let mut query = vec![
             ("query".to_owned(), filters.query.clone()),
             ("limit".to_owned(), filters.limit.to_string()),
@@ -184,10 +181,7 @@ impl ModrinthClient {
     }
 
     pub async fn get_project(slug: &str) -> Result<ModrinthProjectInfo> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()?;
-        Ok(client
+        Ok(super::http()
             .get(format!("{BASE}/project/{slug}"))
             .send()
             .await?
@@ -201,9 +195,7 @@ impl ModrinthClient {
         game_version: Option<&str>,
         loader: Option<&str>,
     ) -> Result<Vec<ModrinthVersionInfo>> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()?;
+        let client = super::http();
         let mut query: Vec<(&str, String)> = vec![("include_changelog", "false".into())];
         if let Some(gv) = game_version {
             query.push(("game_versions", serde_json::to_string(&[gv])?));

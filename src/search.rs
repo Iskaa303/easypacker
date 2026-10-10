@@ -833,7 +833,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         current_y += u16c(item_lines);
 
         let icon_area = Rect::new(inner.x + 1, y, 6, 2);
-        if let Some(proto) = app.proto_cache.get(idx).and_then(|p| p.as_ref()) {
+        if let Some(proto) = r.icon_url.as_ref().and_then(|u| app.icon_cache.get(u)) {
             frame.render_widget(Image::new(proto), icon_area);
         }
 

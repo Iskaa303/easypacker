@@ -8,7 +8,7 @@ use crate::ui;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub struct App {
     // Search state
@@ -25,7 +25,11 @@ pub struct App {
     pub api_key_input: String,
     pub search_offset: usize,
     pub picker: Picker,
-    pub proto_cache: Vec<Option<Protocol>>,
+    /// Decoded icon protocols keyed by icon URL — icons survive re-searching
+    /// (and are only ever downloaded once per session).
+    pub icon_cache: HashMap<String, Protocol>,
+    /// URLs that failed to download or decode, so they are not retried.
+    pub icon_failed: HashSet<String>,
     pub visible_count: Cell<usize>,
     // Mode + project
     pub mode: AppMode,

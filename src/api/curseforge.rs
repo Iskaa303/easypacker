@@ -1,13 +1,12 @@
 use super::types::{CrossPlatform, DepKind, Dependency, Platform, SearchFilters, SearchResult};
 use color_eyre::eyre::Result;
 use serde::Deserialize;
-use std::time::Duration;
 
 const BASE: &str = "https://api.curseforge.com/v1";
 const MINECRAFT_GAME_ID: i32 = 432;
 
 pub struct CurseForgeClient {
-    client: reqwest::Client,
+    api_key: String,
 }
 
 #[derive(Deserialize)]
@@ -133,17 +132,15 @@ struct Links {
 
 impl CurseForgeClient {
     pub fn new(api_key: &str) -> Self {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::HeaderName::from_static("x-api-key"),
-            reqwest::header::HeaderValue::from_str(api_key).unwrap(),
-        );
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .default_headers(headers)
-            .build()
-            .unwrap();
-        Self { client }
+        Self {
+            api_key: api_key.to_owned(),
+        }
+    }
+
+    /// The key rides on each request (a header) rather than on a private
+    /// client, so every client can share the process-wide connection pool.
+    fn request(&self, url: String) -> reqwest::RequestBuilder {
+        super::http().get(url).header("x-api-key", &self.api_key)
     }
 
     /// Search for mods matching `filters`. The response mapping is long but
@@ -174,8 +171,7 @@ impl CurseForgeClient {
             params.push(("classId", cid.to_string()));
         }
         let response = self
-            .client
-            .get(format!("{BASE}/mods/search"))
+            .request(format!("{BASE}/mods/search"))
             .query(&params)
             .send()
             .await?;
@@ -268,8 +264,7 @@ impl CurseForgeClient {
             params.push(("classId", cid.to_string()));
         }
         let resp: SearchResponse = self
-            .client
-            .get(format!("{BASE}/mods/search"))
+            .request(format!("{BASE}/mods/search"))
             .query(&params)
             .send()
             .await?
@@ -295,8 +290,7 @@ impl CurseForgeClient {
             params.push(("modLoaderType", id.to_string()));
         }
         let resp: FilesResponse = self
-            .client
-            .get(format!("{BASE}/mods/{mod_id}/files"))
+            .request(format!("{BASE}/mods/{mod_id}/files"))
             .query(&params)
             .send()
             .await?
@@ -356,8 +350,7 @@ impl CurseForgeClient {
             data: ModData,
         }
         let resp: ModResponse = self
-            .client
-            .get(format!("{BASE}/mods/{mod_id}"))
+            .request(format!("{BASE}/mods/{mod_id}"))
             .send()
             .await?
             .error_for_status()?

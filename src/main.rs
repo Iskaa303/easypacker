@@ -25,38 +25,26 @@ async fn main() -> Result<()> {
     let cfg = config::Config::load()?;
     let cwd = std::env::current_dir()?;
 
-    // Regenerate Easypacker.lock before dispatch for the commands that read
-    // it: the TUI, search and export. An export reads the pack from --output,
-    // so regenerate the lockfile there. The write commands (init/add/remove/
-    // pin/link/set) rebuild it themselves after editing the manifest — doing
-    // it here too would double the API calls.
-    let pack_dir = match &args.cmd {
-        Some(cli::Cmd::Export(e)) => e.output.as_ref().map_or_else(|| cwd.clone(), PathBuf::from),
-        _ => cwd.clone(),
-    };
-    let writes_manifest = matches!(
-        &args.cmd,
-        Some(
-            cli::Cmd::Init(_)
-                | cli::Cmd::Add(_)
-                | cli::Cmd::Remove(_)
-                | cli::Cmd::Pin(_)
-                | cli::Cmd::Link(_)
-                | cli::Cmd::Set(_)
-        )
-    );
-    if !writes_manifest && project::Manifest::detect(&pack_dir).is_some() {
-        match lock::generate(&pack_dir, &cfg).await {
-            Ok(r) => {
-                eprintln!(
-                    "Easypacker.lock: {} pinned, {} failed",
-                    r.resolved, r.failed
-                );
-                for warning in &r.warnings {
-                    eprintln!("easypacker: {warning}");
+    // Only `export` needs a lockfile resolved before it runs (it packs what
+    // the lock holds). The TUI rebuilds it in the background, and the other
+    // commands either never read it (search, list, versions) or rebuild it
+    // themselves after editing the manifest (init/add/remove/pin/link/set) —
+    // regenerating here made every run wait seconds for the network.
+    if let Some(cli::Cmd::Export(e)) = &args.cmd {
+        let pack_dir = e.output.as_ref().map_or_else(|| cwd.clone(), PathBuf::from);
+        if project::Manifest::detect(&pack_dir).is_some() {
+            match lock::generate(&pack_dir, &cfg).await {
+                Ok(r) => {
+                    eprintln!(
+                        "Easypacker.lock: {} pinned, {} failed",
+                        r.resolved, r.failed
+                    );
+                    for warning in &r.warnings {
+                        eprintln!("easypacker: {warning}");
+                    }
                 }
+                Err(e) => eprintln!("easypacker: lockfile not updated: {e:#}"),
             }
-            Err(e) => eprintln!("easypacker: lockfile not updated: {e:#}"),
         }
     }
 
